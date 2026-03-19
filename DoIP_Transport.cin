@@ -1,0 +1,283 @@
+/*@!Encoding:65001*/
+/******************************************************************************
+ * DoIP_Transport.cin - DoIP传输层（基于CANoe DoIP.DLL原生API）
+ *
+ * 本文件提供 UDS_SendRaw() 和 UDS_Init() 的 DoIP 实现，
+ * 与 CAN_Transport.cin 互斥使用。
+ *
+ * 工作原理:
+ *   - on preStart 中调用 DoIP_InitAsTester() 初始化 DoIP DLL
+ *   - UDS_Init() 建立TCP连接并完成 Routing Activation
+ *   - UDS_SendRaw() 通过 DoIP_DataReq() 发送UDS裸字节
+ *   - DoIP_DataInd() 回调接收ECU响应，填入 gUDS_RxBuf
+ *
+ * 不需要ISO-TP分帧：DoIP over TCP天然支持任意长度UDS payload。
+ *
+ * 依赖:
+ *   - DoIP.DLL 已配置为 CANoe Modeling Library
+ *   - PKI_Config.cin 中配置了 gDoIP_* 参数
+ *
+ * 切换回CAN模式时，用 CAN_Transport.cin 替换本文件即可。
+ ******************************************************************************/
+
+variables
+{
+  /* ========== DoIP 连接状态 ========== */
+  int   gDoIP_Connected = 0;         /* 0=未连接, 1=已连接, -1=连接失败 */
+  int   gDoIP_RoutingActive = 0;     /* 0=未激活, 1=已激活 */
+
+  /* ========== DoIP 发送确认 ========== */
+  int   gDoIP_AckReady = 0;          /* 0=等待, 1=ACK成功, -1=NACK */
+
+  /* ========== TesterPresent 保活定时器 ========== */
+  msTimer gUDS_KeepAliveTimer;
+  int     gUDS_KeepAliveActive = 0;
+}
+
+/******************************************************************************
+ * on preStart - 初始化DoIP DLL（测试仪模式）
+ *
+ * 从 PKI_Config.cin 的全局变量读取参数。
+ * 必须在 on preStart 中配置，不能在测试函数中调用。
+ ******************************************************************************/
+on preStart
+{
+  DoIP_InitAsTester();
+
+  DoIP_SetLocalIPaddress(gDoIP_LocalIp);
+  DoIP_SetRemoteIPaddress(gDoIP_EcuIp);
+  DoIP_SetTesterAddress(gDoIP_TesterAddr);
+  DoIP_SetVehicleAddress(gDoIP_EcuAddr);
+
+  if (gDoIP_LocalPort != 0)
+    DoIP_SetLocalTCPPort(gDoIP_LocalPort);
+
+  /* 超时配置 */
+  DoIP_SetControlTimeout(5000);
+  DoIP_SetDiagnosticMessageTimeout(5000);
+
+  write("DoIP_Transport: DLL初始化完成, 目标=%s SA=0x%04X TA=0x%04X",
+        gDoIP_EcuIp, gDoIP_TesterAddr, gDoIP_EcuAddr);
+}
+
+/******************************************************************************
+ * DoIP 回调: 诊断数据接收 (ECU→测试仪)
+ *
+ * data[] 是裸 UDS 响应字节（无 DoIP 头、无 ISO-TP），
+ * 直接填入 gUDS_RxBuf，与 CAN 传输层语义完全一致。
+ ******************************************************************************/
+void DoIP_DataInd(word sourceAddress, word targetAddress, byte data[], dword length)
+{
+  dword i;
+
+  if (length > 4096) length = 4096;
+  for (i = 0; i < length; i++)
+    gUDS_RxBuf[i] = data[i];
+  gUDS_RxLen   = length;
+  gUDS_RxReady = 1;
+  testSupplyTextEvent("UDS_RxDone");
+}
+
+/******************************************************************************
+ * DoIP 回调: 发送确认
+ *
+ * errorCode 0 = DoIP层正确ACK（不代表UDS正响应）
+ ******************************************************************************/
+void DoIP_DataCon(long errorCode)
+{
+  if (errorCode == 0)
+  {
+    gDoIP_AckReady = 1;
+  }
+  else
+  {
+    write("DoIP_Transport: DataCon NACK, errorCode=%d", errorCode);
+    gDoIP_AckReady = -1;
+  }
+  testSupplyTextEvent("DoIP_AckDone");
+}
+
+/******************************************************************************
+ * DoIP 回调: Routing Activation 响应
+ ******************************************************************************/
+void _DoIP_RoutingActivationResponse(word testerAddress, word entityAddress,
+                                      byte responseCode, dword reserved)
+{
+  if (responseCode == 0x10)
+  {
+    gDoIP_RoutingActive = 1;
+    write("DoIP_Transport: Routing Activation成功, entity=0x%04X", entityAddress);
+  }
+  else
+  {
+    gDoIP_RoutingActive = -1;
+    write("DoIP_Transport: Routing Activation失败, code=0x%02X", responseCode);
+  }
+  testSupplyTextEvent("DoIP_RoutingDone");
+}
+
+/******************************************************************************
+ * DoIP 回调: 错误指示
+ ******************************************************************************/
+void DoIP_ErrorInd(long errorCode)
+{
+  write("DoIP_Transport: ErrorInd errorCode=%d", errorCode);
+  gDoIP_Connected = -1;
+}
+
+/******************************************************************************
+ * 初始化 DoIP 传输通道
+ *
+ * 与 CAN 版保持相同的函数签名 UDS_Init(txId, rxId, ecuQualifier)，
+ * 以保证上层代码零修改。txId/rxId 在 DoIP 模式下忽略。
+ *
+ * 实际动作: 建立TCP连接 + Routing Activation。
+ ******************************************************************************/
+void UDS_Init(dword txId, dword rxId, char ecuQualifier[])
+{
+  /* ECU Qualifier 仍需设置（Seed&Key DLL依赖） */
+  strncpy(gUDS_EcuQualifier, ecuQualifier, elcount(gUDS_EcuQualifier)-1);
+  if (0 != diagSetTarget(gUDS_EcuQualifier))
+    write("DoIP_Transport: diagSetTarget失败(DLL调用可能受影响)");
+
+  /* 建立TCP连接并自动执行 Routing Activation */
+  write("DoIP_Transport: 正在连接 %s ...", gDoIP_EcuIp);
+  gDoIP_Connected     = 0;
+  gDoIP_RoutingActive = 0;
+
+  DoIP_ConnectToVehicle();
+
+  /* 等待 Routing Activation 响应 */
+  if (testWaitForTextEvent("DoIP_RoutingDone", 10000) == 0 || gDoIP_RoutingActive != 1)
+  {
+    write("DoIP_Transport: 连接/路由激活失败!");
+    gDoIP_Connected = -1;
+    return;
+  }
+
+  gDoIP_Connected = 1;
+  write("DoIP_Transport: 初始化完成, ECU=%s IP=%s SA=0x%04X TA=0x%04X (CAN ID 0x%03X/0x%03X 忽略)",
+        gUDS_EcuQualifier, gDoIP_EcuIp, gDoIP_TesterAddr, gDoIP_EcuAddr, txId, rxId);
+}
+
+/******************************************************************************
+ * 发送原始UDS请求并等待响应 (DoIP版)
+ * 调用前须预先填入 gUDS_TxBuf[] 和 gUDS_TxLen
+ *
+ * 返回: 1=成功  0=超时  -1=错误
+ *
+ * 注意: DoIP模式下不支持 gIsoTp_InterruptAfterCF（无ISO-TP分帧概念），
+ * 该变量设置在DoIP模式下被忽略，不会返回 2。
+ ******************************************************************************/
+int UDS_SendRaw()
+{
+  long  ret;
+  int   txLen;
+  dword t0, elapsedMs;
+
+  if (gDoIP_Connected != 1)
+  {
+    write("DoIP_Transport: 未连接, 无法发送");
+    return -1;
+  }
+
+  gUDS_RxReady   = 0;
+  gUDS_RxLen     = 0;
+  gDoIP_AckReady = 0;
+  txLen          = gUDS_TxLen;
+
+  /* 请求间隔: 确保ECU有足够时间处理上一条请求 */
+  testWaitForTextEvent("__delay__", cUDS_InterReqDelay);
+
+  /* 打印TX报文 */
+  UDS_FormatHex(gUDS_TxBuf, txLen, gUDS_HexBuf, elcount(gUDS_HexBuf));
+  t0 = timeNow();
+  write("TX [DoIP→0x%04X] %d bytes: %s", gDoIP_EcuAddr, txLen, gUDS_HexBuf);
+
+  /* 发送诊断报文 */
+  ret = DoIP_DataReq(gDoIP_EcuAddr, gUDS_TxBuf, (dword)txLen);
+  if (ret != 0)
+  {
+    elapsedMs = (timeNow() - t0) / 100;
+    write("TX [DoIP→0x%04X] ERROR: DoIP_DataReq失败 ret=%d (%dms)",
+          gDoIP_EcuAddr, ret, elapsedMs);
+    return -1;
+  }
+
+  /* 等待响应 */
+  if (testWaitForTextEvent("UDS_RxDone", cUDS_DefaultTimeout) == 0)
+  {
+    elapsedMs = (timeNow() - t0) / 100;
+    write("RX [DoIP←0x%04X] TIMEOUT: 等待响应超时 %dms", gDoIP_EcuAddr, elapsedMs);
+    return 0;
+  }
+  if (gUDS_RxReady == -1)
+  {
+    elapsedMs = (timeNow() - t0) / 100;
+    write("RX [DoIP←0x%04X] ERROR: 接收错误 (%dms)", gDoIP_EcuAddr, elapsedMs);
+    return -1;
+  }
+
+  /* 打印RX报文 */
+  elapsedMs = (timeNow() - t0) / 100;
+  UDS_FormatHex(gUDS_RxBuf, gUDS_RxLen, gUDS_HexBuf, elcount(gUDS_HexBuf));
+  write("RX [DoIP←0x%04X] %d bytes (%dms): %s",
+        gDoIP_EcuAddr, gUDS_RxLen, elapsedMs, gUDS_HexBuf);
+
+  /* NRC 0x78 Pending */
+  while (gUDS_RxLen >= 3 && gUDS_RxBuf[0] == 0x7F && gUDS_RxBuf[2] == 0x78)
+  {
+    write("RX [DoIP←0x%04X] NRC 0x78 Pending, 继续等待...", gDoIP_EcuAddr);
+    gUDS_RxReady = 0;
+    gUDS_RxLen   = 0;
+    if (testWaitForTextEvent("UDS_RxDone", cUDS_P2StarTimeout) == 0)
+    {
+      elapsedMs = (timeNow() - t0) / 100;
+      write("RX [DoIP←0x%04X] TIMEOUT: P2*超时 %dms", gDoIP_EcuAddr, elapsedMs);
+      return 0;
+    }
+    if (gUDS_RxReady != 1) return 0;
+    elapsedMs = (timeNow() - t0) / 100;
+    UDS_FormatHex(gUDS_RxBuf, gUDS_RxLen, gUDS_HexBuf, elcount(gUDS_HexBuf));
+    write("RX [DoIP←0x%04X] %d bytes (%dms): %s",
+          gDoIP_EcuAddr, gUDS_RxLen, elapsedMs, gUDS_HexBuf);
+  }
+
+  return 1;
+}
+
+/******************************************************************************
+ * TesterPresent 保活定时器回调
+ * 每 2000ms 通过 DoIP 发送 3E 80, 保持ECU扩展会话不超时
+ ******************************************************************************/
+on timer gUDS_KeepAliveTimer
+{
+  byte kaBuf[2];
+  if (!gUDS_KeepAliveActive) return;
+  if (gDoIP_Connected != 1) return;
+
+  kaBuf[0] = 0x3E;   /* TesterPresent */
+  kaBuf[1] = 0x80;   /* suppressPositiveResponse */
+  DoIP_DataReq(gDoIP_EcuAddr, kaBuf, 2);
+  setTimer(gUDS_KeepAliveTimer, 2000);
+}
+
+/******************************************************************************
+ * 启动 TesterPresent 保活 (3E 80, 2000ms周期)
+ ******************************************************************************/
+void UDS_StartKeepAlive()
+{
+  gUDS_KeepAliveActive = 1;
+  setTimer(gUDS_KeepAliveTimer, 2000);
+  write("DoIP_Transport: KeepAlive started (3E 80 every 2000ms)");
+}
+
+/******************************************************************************
+ * 停止 TesterPresent 保活
+ ******************************************************************************/
+void UDS_StopKeepAlive()
+{
+  gUDS_KeepAliveActive = 0;
+  cancelTimer(gUDS_KeepAliveTimer);
+  write("DoIP_Transport: KeepAlive stopped");
+}

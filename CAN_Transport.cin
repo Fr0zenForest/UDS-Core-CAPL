@@ -1,0 +1,485 @@
+/*@!Encoding:65001*/
+/******************************************************************************
+ * CAN_Transport.cin - CAN FD传输层（ISO-TP直接实现）
+ *
+ * 本文件从 UDS_Transport.cin 拆分而来，包含CAN FD专用内容：
+ *   - ISO-TP 分帧/重组 (SF/FF/CF/FC)
+ *   - UDS_SendRaw() CAN版：手动ISO-TP分帧发送+等待响应
+ *   - on message 接收回调
+ *   - UDS_Init() CAN版：设置TxId/RxId/EcuQualifier
+ *
+ * 本文件提供 UDS_SendRaw() 和 UDS_Init()，供 UDS_Services.cin 中的
+ * 服务函数调用。必须在 UDS_Services.cin 之前 #include。
+ *
+ * 切换到DoIP模式时，用 DoIP_Transport.cin 替换本文件即可。
+ ******************************************************************************/
+
+variables
+{
+  /* ========== ISO-TP 接收状态机 ========== */
+  dword gIsoTp_RxExpected;     /* 多帧：期望总字节数 */
+  byte  gIsoTp_RxSN;           /* 期望的下一个CF序号 */
+  int   gIsoTp_RxActive;       /* 正在接收多帧 */
+
+  /* ========== ISO-TP 发送时等待FC ========== */
+  int   gIsoTp_FcReady;        /* 0=等待  1=CTS  -1=Abort */
+  byte  gIsoTp_FcBS;
+  byte  gIsoTp_FcSTmin;
+
+  /* ========== ISO-TP 超时 ========== */
+  const long cIsoTp_FcTimeout  = 1000;
+
+  /* ========== CAN ID (动态, UDS_Init设置) ========== */
+  dword gUDS_TxId              = 0x000;
+  dword gUDS_RxId              = 0x000;
+
+  /* ========== TesterPresent 保活定时器 ========== */
+  msTimer gUDS_KeepAliveTimer;
+  int     gUDS_KeepAliveActive = 0;
+
+  /* ========== ISO-TP 多帧互斥锁 ========== */
+  int     gIsoTp_TxBusy        = 0;  /* 多帧发送中, 禁止KeepAlive */
+}
+
+/******************************************************************************
+ * CAN FD DLC编码转实际数据长度
+ ******************************************************************************/
+int IsoTp_DlcToLen(int dlc)
+{
+  if (dlc <= 8)  return dlc;
+  if (dlc == 9)  return 12;
+  if (dlc == 10) return 16;
+  if (dlc == 11) return 20;
+  if (dlc == 12) return 24;
+  if (dlc == 13) return 32;
+  if (dlc == 14) return 48;
+  if (dlc == 15) return 64;
+  return dlc;
+}
+
+/******************************************************************************
+ * 实际数据长度转CAN FD最小DLC编码
+ ******************************************************************************/
+int IsoTp_LenToFdDlc(int len)
+{
+  if (len <= 8)  return 8;
+  if (len <= 12) return 9;
+  if (len <= 16) return 10;
+  if (len <= 20) return 11;
+  if (len <= 24) return 12;
+  if (len <= 32) return 13;
+  if (len <= 48) return 14;
+  if (len <= 64) return 15;
+  return 15;
+}
+
+/******************************************************************************
+ * ISO-TP 接收 (ECU→测试仪, 动态RxId)
+ ******************************************************************************/
+on message 0x600-0x7FF
+{
+  byte  pci;
+  byte  ft;
+  byte  sn;
+  byte  fs;
+  dword dlen;
+  int   i;
+  int   dataStart;
+  int   frameLen;
+
+  if (this.id != gUDS_RxId) return;
+
+  frameLen = IsoTp_DlcToLen(this.dlc);
+  if (frameLen < 1) return;
+  pci = this.byte(0);
+  ft  = (pci >> 4) & 0x0F;
+
+  if (ft == 0)           /* ---- Single Frame ---- */
+  {
+    dlen = (dword)(pci & 0x0F);
+    if (dlen == 0)
+    {
+      /* CAN FD扩展SF: 第1字节=0x00, 第2字节=实际长度 */
+      if (frameLen < 2) { gUDS_RxReady = -1; testSupplyTextEvent("UDS_RxDone"); return; }
+      dlen = (dword)this.byte(1);
+      dataStart = 2;
+    }
+    else
+    {
+      dataStart = 1;
+    }
+    if (dlen == 0 || (int)dlen > frameLen - dataStart) { gUDS_RxReady = -1; testSupplyTextEvent("UDS_RxDone"); return; }
+    for (i = 0; i < (int)dlen; i++)
+      gUDS_RxBuf[i] = this.byte(dataStart + i);
+    gUDS_RxLen      = dlen;
+    gUDS_RxReady    = 1;
+    gIsoTp_RxActive = 0;
+    testSupplyTextEvent("UDS_RxDone");
+  }
+  else if (ft == 1)      /* ---- First Frame ---- */
+  {
+    dlen = ((dword)(pci & 0x0F) << 8) | (dword)this.byte(1);
+    if (dlen == 0)
+    {
+      /* CAN FD扩展FF: 前2字节=0x1000, 字节2-5=32位长度 */
+      if (frameLen < 6) { gUDS_RxReady = -1; testSupplyTextEvent("UDS_RxDone"); return; }
+      dlen = ((dword)this.byte(2) << 24) | ((dword)this.byte(3) << 16)
+           | ((dword)this.byte(4) << 8)  |  (dword)this.byte(5);
+      dataStart = 6;
+    }
+    else
+    {
+      dataStart = 2;
+    }
+    if (dlen == 0 || dlen > 4096) { gUDS_RxReady = -1; testSupplyTextEvent("UDS_RxDone"); return; }
+    gIsoTp_RxExpected = dlen;
+    gIsoTp_RxSN       = 1;
+    gIsoTp_RxActive   = 1;
+    gUDS_RxLen        = 0;
+    for (i = dataStart; i < frameLen && gUDS_RxLen < dlen; i++)
+    {
+      gUDS_RxBuf[gUDS_RxLen] = this.byte(i);
+      gUDS_RxLen++;
+    }
+    IsoTp_SendFC();   /* 立即回复 Flow Control: CTS */
+  }
+  else if (ft == 2)      /* ---- Consecutive Frame ---- */
+  {
+    if (!gIsoTp_RxActive) return;
+    sn = pci & 0x0F;
+    if (sn != gIsoTp_RxSN)
+    {
+      gUDS_RxReady    = -1;
+      gIsoTp_RxActive = 0;
+      testSupplyTextEvent("UDS_RxDone");
+      return;
+    }
+    gIsoTp_RxSN = (byte)((gIsoTp_RxSN + 1) & 0x0F);
+    for (i = 1; i < frameLen && gUDS_RxLen < gIsoTp_RxExpected; i++)
+    {
+      gUDS_RxBuf[gUDS_RxLen] = this.byte(i);
+      gUDS_RxLen++;
+    }
+    if (gUDS_RxLen >= gIsoTp_RxExpected)
+    {
+      gUDS_RxLen      = gIsoTp_RxExpected;
+      gIsoTp_RxActive = 0;
+      gUDS_RxReady    = 1;
+      testSupplyTextEvent("UDS_RxDone");
+    }
+  }
+  else if (ft == 3)      /* ---- Flow Control (ECU允许测试仪继续发CF) ---- */
+  {
+    fs = pci & 0x0F;
+    if (fs == 0)
+    {
+      gIsoTp_FcBS    = this.byte(1);
+      /* STmin: ISO 15765-2 标准解析 */
+      {
+        byte rawST;
+        rawST = this.byte(2);
+        if (rawST <= 0x7F)
+          gIsoTp_FcSTmin = rawST;           /* 0~127ms */
+        else if (rawST >= 0xF1 && rawST <= 0xF9)
+          gIsoTp_FcSTmin = 1;               /* 100~900us, CAPL精度限制按1ms */
+        else
+          gIsoTp_FcSTmin = 0x7F;            /* 保留值, 按127ms保守处理 */
+      }
+      gIsoTp_FcReady = 1;
+      testSupplyTextEvent("UDS_FcDone");
+    }
+    else if (fs == 1) { /* Wait - 继续等待，不改变gIsoTp_FcReady */ }
+    else              { gIsoTp_FcReady = -1; testSupplyTextEvent("UDS_FcDone"); }
+  }
+}
+
+/******************************************************************************
+ * 发送 Flow Control 帧 (CTS, 测试仪→ECU, 动态TxId)
+ ******************************************************************************/
+void IsoTp_SendFC()
+{
+  message * msg;
+  msg.dlc     = 8;
+  msg.FDF     = gUDS_UseFD;  /* 跟随全局CAN FD开关 */
+  msg.BRS     = 0;
+  msg.id      = gUDS_TxId;
+  msg.byte(0) = 0x30;   /* FC, CTS */
+  msg.byte(1) = 0x00;   /* BS=0: 无块限制 */
+  msg.byte(2) = 0x00;   /* STmin=0: 立即发 */
+  msg.byte(3) = 0x00;
+  msg.byte(4) = 0x00;
+  msg.byte(5) = 0x00;
+  msg.byte(6) = 0x00;
+  msg.byte(7) = 0x00;
+  output(msg);
+}
+
+/******************************************************************************
+ * 初始化 CAN 传输通道
+ ******************************************************************************/
+void UDS_Init(dword txId, dword rxId, char ecuQualifier[])
+{
+  gUDS_TxId = txId;
+  gUDS_RxId = rxId;
+  strncpy(gUDS_EcuQualifier, ecuQualifier, elcount(gUDS_EcuQualifier)-1);
+  if (0 != diagSetTarget(gUDS_EcuQualifier))
+    write("CAN_Transport: diagSetTarget失败(DLL调用可能受影响)");
+  else
+    write("CAN_Transport: 初始化完成, ECU=%s TxID=0x%03X RxID=0x%03X",
+          gUDS_EcuQualifier, gUDS_TxId, gUDS_RxId);
+}
+
+/******************************************************************************
+ * 发送原始UDS请求并等待响应 (手动ISO-TP)
+ * 调用前须预先填入 gUDS_TxBuf[] 和 gUDS_TxLen
+ *
+ * 返回: 1=成功  0=超时  -1=错误  2=ISOTP中断(灌装中断测试)
+ ******************************************************************************/
+int UDS_SendRaw()
+{
+  message * msg;
+  int   txLen;
+  int   offset;
+  int   chunkLen;
+  int   batchCount;
+  byte  sn;
+  int   i;
+  dword t0, t1, elapsedMs;
+  int   fdDlc, fdLen;
+  int   cfDlc, cfLen;
+
+  gUDS_RxReady    = 0;
+  gUDS_RxLen      = 0;
+  gIsoTp_RxActive = 0;
+  txLen           = gUDS_TxLen;
+
+  /* 请求间隔: 确保ECU有足够时间处理上一条请求 */
+  testWaitForTextEvent("__delay__", cUDS_InterReqDelay);
+
+  /* 打印TX报文 */
+  UDS_FormatHex(gUDS_TxBuf, txLen, gUDS_HexBuf, elcount(gUDS_HexBuf));
+  t0 = timeNow();
+  write("TX [0x%03X] %d bytes: %s", gUDS_TxId, txLen, gUDS_HexBuf);
+
+  msg.FDF = gUDS_UseFD;
+  msg.BRS = 0;
+  msg.id  = gUDS_TxId;
+
+  if (txLen <= 7)
+  {
+    /* ---- Single Frame (经典CAN和CAN FD通用) ---- */
+    msg.dlc     = 8;
+    msg.byte(0) = (byte)txLen;
+    for (i = 0; i < txLen; i++)
+      msg.byte(i + 1) = gUDS_TxBuf[i];
+    for (i = txLen + 1; i < 8; i++)
+      msg.byte(i) = 0x00;
+    output(msg);
+  }
+  else if (txLen <= 62 && gUDS_UseFD)
+  {
+    /* ---- CAN FD Extended Single Frame (仅CAN FD模式) ---- */
+    fdDlc = IsoTp_LenToFdDlc(txLen + 2);
+    fdLen = IsoTp_DlcToLen(fdDlc);
+    msg.dlc     = fdDlc;
+    msg.byte(0) = 0x00;                      /* Extended SF PCI */
+    msg.byte(1) = (byte)txLen;               /* SF_DL */
+    for (i = 0; i < txLen; i++)
+      msg.byte(i + 2) = gUDS_TxBuf[i];
+    for (i = txLen + 2; i < fdLen; i++)
+      msg.byte(i) = 0xCC;                    /* Padding */
+    output(msg);
+  }
+  else
+  {
+    /* ---- First Frame ---- */
+    gIsoTp_FcReady = 0;
+    gIsoTp_TxBusy  = 1;  /* 锁定: 禁止KeepAlive干扰多帧传输 */
+    if (gUDS_UseFD)
+    {
+      msg.dlc = 15;  /* CAN FD: 64字节 */
+      msg.byte(0) = (byte)(0x10 | ((txLen >> 8) & 0x0F));
+      msg.byte(1) = (byte)(txLen & 0xFF);
+      for (i = 0; i < 62 && i < txLen; i++)
+        msg.byte(i + 2) = gUDS_TxBuf[i];
+      for (i = txLen + 2; i < 64; i++)
+        msg.byte(i) = 0xCC;
+    }
+    else
+    {
+      msg.dlc = 8;
+      msg.byte(0) = (byte)(0x10 | ((txLen >> 8) & 0x0F));
+      msg.byte(1) = (byte)(txLen & 0xFF);
+      for (i = 0; i < 6; i++)
+        msg.byte(i + 2) = gUDS_TxBuf[i];
+    }
+    output(msg);
+
+    /* 等待 Flow Control */
+    if (testWaitForTextEvent("UDS_FcDone", cIsoTp_FcTimeout) == 0 || gIsoTp_FcReady <= 0)
+    {
+      elapsedMs = (timeNow() - t0) / 100;
+      write("RX [0x%03X] ERROR: FC超时或Abort (%dms)", gUDS_RxId, elapsedMs);
+      gIsoTp_TxBusy = 0;
+      return -1;
+    }
+
+    /* ---- Consecutive Frames ---- */
+    offset     = gUDS_UseFD ? 62 : 6;
+    if (offset > txLen) offset = txLen;
+    sn         = 1;
+    batchCount = 0;
+    while (offset < txLen)
+    {
+      chunkLen = txLen - offset;
+      if (gUDS_UseFD)
+      {
+        if (chunkLen > 63) chunkLen = 63;
+        cfDlc = IsoTp_LenToFdDlc(chunkLen + 1);
+        cfLen = IsoTp_DlcToLen(cfDlc);
+        msg.dlc     = cfDlc;
+        msg.byte(0) = (byte)(0x20 | (sn & 0x0F));
+        for (i = 0; i < chunkLen; i++)
+          msg.byte(i + 1) = gUDS_TxBuf[offset + i];
+        for (i = chunkLen + 1; i < cfLen; i++)
+          msg.byte(i) = 0xCC;
+      }
+      else
+      {
+        if (chunkLen > 7) chunkLen = 7;
+        msg.dlc     = 8;
+        msg.byte(0) = (byte)(0x20 | (sn & 0x0F));
+        for (i = 0; i < chunkLen; i++)
+          msg.byte(i + 1) = gUDS_TxBuf[offset + i];
+        for (i = chunkLen + 1; i < 8; i++)
+          msg.byte(i) = 0x00;
+      }
+      output(msg);
+
+      sn = (byte)((sn + 1) & 0x0F);
+      offset    += chunkLen;
+      batchCount++;
+
+      /* ---- ISOTP中断钩子: 灌装中断测试 ----
+       * 语义: 第 N 帧 CF 后中断 (按帧数, 非字节偏移)
+       * CAN FD下每帧最多63字节, 经典CAN每帧7字节,
+       * 同样的N值在CAN FD下中断点的字节偏移更靠后.
+       * TC04设置此值时需考虑当前模式下的CF总帧数. */
+      if (gIsoTp_InterruptAfterCF > 0 && batchCount >= gIsoTp_InterruptAfterCF)
+      {
+        elapsedMs = (timeNow() - t0) / 100;
+        write("ISOTP中断: CF #%d 发送后触发中断 (%dms), 剩余 %d/%d 字节未发送",
+              batchCount, elapsedMs, txLen - offset, txLen);
+        gIsoTp_InterruptAfterCF = 0;
+        gIsoTp_TxBusy = 0;
+        return 2;  /* 特殊返回码: 传输被中断 */
+      }
+
+      /* BS限制: 每BS帧后等待下一FC */
+      if (gIsoTp_FcBS > 0 && (batchCount % (int)gIsoTp_FcBS) == 0 && offset < txLen)
+      {
+        gIsoTp_FcReady = 0;
+        if (testWaitForTextEvent("UDS_FcDone", cIsoTp_FcTimeout) == 0 || gIsoTp_FcReady <= 0)
+        {
+          elapsedMs = (timeNow() - t0) / 100;
+          write("RX [0x%03X] ERROR: CF阶段FC超时 (%dms)", gUDS_RxId, elapsedMs);
+          gIsoTp_TxBusy = 0;
+          return -1;
+        }
+        batchCount = 0;
+      }
+
+      /* STmin帧间隔 */
+      if (gIsoTp_FcSTmin > 0 && offset < txLen)
+        testWaitForTextEvent("__stmin__", (long)gIsoTp_FcSTmin);
+    }
+  }
+
+  gIsoTp_TxBusy = 0;  /* 解锁: 多帧发送完成 */
+
+  /* 等待响应 */
+  if (testWaitForTextEvent("UDS_RxDone", cUDS_DefaultTimeout) == 0)
+  {
+    elapsedMs = (timeNow() - t0) / 100;
+    write("RX [0x%03X] TIMEOUT: 等待响应超时 %dms", gUDS_RxId, elapsedMs);
+    return 0;
+  }
+  if (gUDS_RxReady == -1)
+  {
+    elapsedMs = (timeNow() - t0) / 100;
+    write("RX [0x%03X] ERROR: ISO-TP接收错误 (%dms)", gUDS_RxId, elapsedMs);
+    return -1;
+  }
+
+  /* 打印RX报文 */
+  elapsedMs = (timeNow() - t0) / 100;
+  UDS_FormatHex(gUDS_RxBuf, gUDS_RxLen, gUDS_HexBuf, elcount(gUDS_HexBuf));
+  write("RX [0x%03X] %d bytes (%dms): %s", gUDS_RxId, gUDS_RxLen, elapsedMs, gUDS_HexBuf);
+
+  /* NRC 0x78 Pending */
+  while (gUDS_RxLen >= 3 && gUDS_RxBuf[0] == 0x7F && gUDS_RxBuf[2] == 0x78)
+  {
+    write("RX [0x%03X] NRC 0x78 Pending, 继续等待...", gUDS_RxId);
+    gUDS_RxReady = 0;
+    gUDS_RxLen   = 0;
+    if (testWaitForTextEvent("UDS_RxDone", cUDS_P2StarTimeout) == 0)
+    {
+      elapsedMs = (timeNow() - t0) / 100;
+      write("RX [0x%03X] TIMEOUT: P2*超时 %dms", gUDS_RxId, elapsedMs);
+      return 0;
+    }
+    if (gUDS_RxReady != 1) return 0;
+    elapsedMs = (timeNow() - t0) / 100;
+    UDS_FormatHex(gUDS_RxBuf, gUDS_RxLen, gUDS_HexBuf, elcount(gUDS_HexBuf));
+    write("RX [0x%03X] %d bytes (%dms): %s", gUDS_RxId, gUDS_RxLen, elapsedMs, gUDS_HexBuf);
+  }
+
+  return 1;
+}
+
+/******************************************************************************
+ * TesterPresent 保活定时器回调
+ * 每 2000ms 发送 3E 80 (suppressPositiveResponse), 保持ECU扩展会话不超时
+ ******************************************************************************/
+on timer gUDS_KeepAliveTimer
+{
+  message * kaMsg;
+  if (!gUDS_KeepAliveActive) return;
+  if (gUDS_TxId == 0) return;
+  if (gIsoTp_TxBusy) return;  /* 多帧发送中, 跳过本次KeepAlive */
+
+  kaMsg.id      = gUDS_TxId;
+  kaMsg.FDF     = gUDS_UseFD;
+  kaMsg.BRS     = 0;
+  kaMsg.dlc     = 8;
+  kaMsg.byte(0) = 0x02;   /* SF, DL=2 */
+  kaMsg.byte(1) = 0x3E;   /* TesterPresent */
+  kaMsg.byte(2) = 0x80;   /* suppressPositiveResponse */
+  kaMsg.byte(3) = 0x00;
+  kaMsg.byte(4) = 0x00;
+  kaMsg.byte(5) = 0x00;
+  kaMsg.byte(6) = 0x00;
+  kaMsg.byte(7) = 0x00;
+  output(kaMsg);
+  setTimer(gUDS_KeepAliveTimer, 2000);
+}
+
+/******************************************************************************
+ * 启动 TesterPresent 保活 (3E 80, 2000ms周期)
+ ******************************************************************************/
+void UDS_StartKeepAlive()
+{
+  gUDS_KeepAliveActive = 1;
+  setTimer(gUDS_KeepAliveTimer, 2000);
+  write("CAN_Transport: KeepAlive started (3E 80 every 2000ms)");
+}
+
+/******************************************************************************
+ * 停止 TesterPresent 保活
+ ******************************************************************************/
+void UDS_StopKeepAlive()
+{
+  gUDS_KeepAliveActive = 0;
+  cancelTimer(gUDS_KeepAliveTimer);
+  write("CAN_Transport: KeepAlive stopped");
+}
