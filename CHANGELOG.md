@@ -5,6 +5,35 @@
 
 ---
 
+## [v1.5] - 2026-03-22
+
+### 修复: ECUReset 未停止 KeepAlive & SecurityAccess 子功能号硬编码
+
+**影响范围**: 所有使用 `UDS_ECUReset_Hard()` 和 `UDS_SecurityAccess_*` 的项目
+
+**修复内容**:
+
+1. **`UDS_ECUReset_Hard()` — 复位前停止 S3 保活**
+   - 复位后 ECU 重启，若不停止 KeepAlive，会在 ECU 未就绪时发 3E 导致总线错误
+   - 修复: 发送 `11 01` 前调用 `UDS_StopKeepAlive()`
+
+2. **`UDS_SecurityAccess_RequestSeed()` / `SendKey()` — 子功能号改用 `gUDS_SecurityLevel`**
+   - 原代码 RequestSeed 硬编码 `27 01`，SendKey 硬编码 `27 02`
+   - 但 `UDS_GenerateKeyFromSeed()` 传给 DLL 的是 `gUDS_SecurityLevel`，导致不一致
+   - 修复: RequestSeed 改为 `27 [gUDS_SecurityLevel]`，SendKey 改为 `27 [gUDS_SecurityLevel+1]`
+   - PKI 项目 (level=0x01) 行为不变；SecurityFlash 项目 (level=0x11) 现在正确发送 `27 11` / `27 12`
+
+**迁移步骤**: 使用非默认 SecurityLevel 的项目需在调用安全访问前设置 `gUDS_SecurityLevel`：
+```c
+gUDS_SecurityLevel = 0x11;  // Flash-level security
+UDS_SecurityAccess_Unlock();
+```
+
+**同步变更的文件**:
+- `UDS_Services.cin` — 3处修改
+
+---
+
 ## [v1.4] - 2026-03-19
 
 ### 新增: 7个UDS服务函数 (从SecurityFlash项目同步)

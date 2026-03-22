@@ -142,6 +142,7 @@ int UDS_DiagSessionControl_Default()
  ******************************************************************************/
 int UDS_ECUReset_Hard()
 {
+  UDS_StopKeepAlive();
   gUDS_TxBuf[0] = 0x11; gUDS_TxBuf[1] = 0x01; gUDS_TxLen = 2;
   if (UDS_SendRaw() <= 0) { UDS_FormatRxSummary(2); return 0; }
   UDS_FormatRxSummary(2);
@@ -158,7 +159,7 @@ int UDS_SecurityAccess_RequestSeed(byte seedOut[], int seedBufSize, int &seedAct
   int retry;
   for (retry = 0; retry < 2; retry++)
   {
-    gUDS_TxBuf[0] = 0x27; gUDS_TxBuf[1] = 0x01; gUDS_TxLen = 2;
+    gUDS_TxBuf[0] = 0x27; gUDS_TxBuf[1] = (byte)gUDS_SecurityLevel; gUDS_TxLen = 2;
     if (UDS_SendRaw() <= 0) { UDS_FormatRxSummary(3); return 0; }
 
     /* NRC 0x37: penalty timer still active, wait and retry once */
@@ -220,7 +221,7 @@ int UDS_SecurityAccess_RequestSeed(byte seedOut[], int seedBufSize, int &seedAct
 int UDS_SecurityAccess_SendKey(byte keyData[], int keyLen)
 {
   int i;
-  gUDS_TxBuf[0] = 0x27; gUDS_TxBuf[1] = 0x02;
+  gUDS_TxBuf[0] = 0x27; gUDS_TxBuf[1] = (byte)(gUDS_SecurityLevel + 1);
   for (i = 0; i < keyLen; i++)
     gUDS_TxBuf[2 + i] = keyData[i];
   gUDS_TxLen = 2 + keyLen;
