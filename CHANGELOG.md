@@ -5,6 +5,82 @@
 
 ---
 
+## [v2.0] - 2026-03-25
+
+### 新增: 独立 DoIP DLL，脱离 CANoe DoIP Modeling Library 依赖
+
+**影响范围**: 使用 `DoIP_Transport.cin` 的所有项目
+
+**变更原因**: 原 DoIP 传输层完全依赖 CANoe 内置 DoIP.DLL (Modeling Library)，必须在 CANoe Simulation Setup 中配置 DoIP 节点才能使用。本次开发自定义 `DoIP_Core.dll`，通过 WinSock2 原生 TCP/UDP 实现 ISO 13400-2 DoIP 协议，彻底去除对 CANoe DoIP 建模库的依赖。
+
+**新增文件**:
+| 文件 | 说明 |
+|------|------|
+| `DLL/DoIP_Core/DoIP_Core.cpp` | CAPL DLL 导出层 + caplDllTable4 (11个函数) |
+| `DLL/DoIP_Core/doip_protocol.h/cpp` | DoIP 协议层: 报文构建/解析 (ISO 13400-2) |
+| `DLL/DoIP_Core/doip_tcp.h/cpp` | TCP/UDP 连接管理 + KeepAlive 后台线程 (WinSock2) |
+| `DLL/DoIP_Core/CMakeLists.txt` | CMake 构建配置 (Win32 + /MT 静态CRT) |
+| `DLL/DoIP_Core/cdll.h` | Vector CAPL DLL 接口头文件 |
+| `Modules/DoIP_Core.dll` | 编译产物 (x86, 82KB, 零外部依赖) |
+
+**DoIP_Core.dll 导出函数 (CAPL 可调用)**:
+| 函数 | 说明 |
+|------|------|
+| `DoIP_CreateConnection(localIp, remoteIp, testerAddr, ecuAddr)` | 配置连接参数 |
+| `DoIP_SetTimeout(controlMs, diagMs)` | 设置超时 |
+| `DoIP_Connect()` | TCP 连接 + Routing Activation (阻塞) |
+| `DoIP_Send(targetAddr, data[], len)` | 发送 UDS 数据 (自动 DoIP 封装) |
+| `DoIP_Recv(data[], bufSize, timeoutMs)` | 接收 UDS 响应 (同步阻塞) |
+| `DoIP_StartKeepAlive(intervalMs)` | 启动 TesterPresent 后台线程 |
+| `DoIP_StopKeepAlive()` | 停止 KeepAlive |
+| `DoIP_Disconnect()` | 断开连接 |
+| `DoIP_GetStatus()` | 查询连接状态 |
+| `DoIP_GetLastError()` | 查询最后错误码 |
+| `DoIP_VehicleIdentification(broadcastIp, vinOut[], logicalAddr, timeoutMs)` | UDP 车辆发现 |
+
+**DoIP_Transport.cin 改造** (283行 → ~140行):
+- 删除: `on preStart` 中的 `DoIP_InitAsTester()` 等 CANoe DLL 初始化
+- 删除: 4个 CANoe 回调函数 (`DoIP_DataInd`, `DoIP_DataCon`, `_DoIP_RoutingActivationResponse`, `DoIP_ErrorInd`)
+- 删除: `msTimer gUDS_KeepAliveTimer` 及 `on timer` 回调 (KeepAlive 改由 DLL 内部线程管理)
+- 新增: `#pragma library("./Modules/DoIP_Core.dll")` 加载自定义 DLL
+- 改造: `UDS_SendRaw()` 从事件驱动回调改为同步阻塞 (`DoIP_Send` + `DoIP_Recv`)
+- 改造: `UDS_StartKeepAlive()` / `UDS_StopKeepAlive()` 转发 DLL 后台线程
+
+**架构对比**:
+```
+之前:  CAPL → CANoe DoIP.DLL (Modeling Library) → CANoe 网络栈 → Vector 硬件
+现在:  CAPL → DoIP_Core.dll (自定义) → WinSock2 → Windows TCP/IP → 任意网卡
+```
+
+**关键设计**:
+- **同步阻塞模式**: `DoIP_Recv()` 内部使用 `select()` + `recv()`，阻塞 CAPL 测试线程直到收到响应或超时。与 CAN Transport 的 `testWaitForTextEvent` 行为效果一致。
+- **KeepAlive 线程安全**: DLL 内部 `CreateThread` 后台发送 3E 80，与主线程 `send()` 通过 `CRITICAL_SECTION` 互斥。
+- **自动处理**: Alive Check Request 自动回复、Diagnostic Positive ACK 自动跳过、NRC 0x78 仍在 CAPL 侧循环。
+- **SecurityAccess 不变**: Seed&Key 仍走 CANoe 的 `diagGenerateKeyFromSeed()`，只有传输层独立。
+- **协议参考**: libdoip (https://github.com/AVL-DiTEST-DiagDev/libdoip) 的协议层逻辑。
+
+**不再需要的 CANoe 配置**:
+- CANoe Simulation Setup 中的 DoIP Modeling Library
+- CANoe 网络配置中的 DoIP 节点/通道
+- Vector 硬件 (VN5620 等仍可用，但作为普通 Windows 网卡使用，普通网口也能用)
+
+**网络配置**: 直接在 Windows 网卡属性中配置 IP，`gDoIP_LocalIp` 填对应网卡 IP 即可。
+
+**编译方法**:
+```bat
+cd DLL\DoIP_Core
+cmake -B build -A Win32
+cmake --build build --config Release
+:: 拷贝 build\Release\DoIP_Core.dll → Modules\DoIP_Core.dll
+```
+
+**迁移步骤**: 上层测试脚本**无需任何修改**。`UDS_Init()` / `UDS_SendRaw()` / `UDS_StartKeepAlive()` 等接口签名完全不变。只需:
+1. 将 `Modules/DoIP_Core.dll` 放到工程目录
+2. 使用新的 `DoIP_Transport.cin`
+3. Windows 网卡配好 IP
+
+---
+
 ## [v1.5] - 2026-03-22
 
 ### 修复: ECUReset 未停止 KeepAlive & SecurityAccess 子功能号硬编码
