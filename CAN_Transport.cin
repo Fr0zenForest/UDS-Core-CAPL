@@ -131,7 +131,7 @@ on message 0x600-0x7FF
     {
       dataStart = 2;
     }
-    if (dlen == 0 || dlen > 4096) { gUDS_RxReady = -1; testSupplyTextEvent("UDS_RxDone"); return; }
+    if (dlen == 0 || dlen > elcount(gUDS_RxBuf)) { gUDS_RxReady = -1; testSupplyTextEvent("UDS_RxDone"); return; }
     gIsoTp_RxExpected = dlen;
     gIsoTp_RxSN       = 1;
     gIsoTp_RxActive   = 1;
@@ -222,11 +222,16 @@ void UDS_Init(dword txId, dword rxId, char ecuQualifier[])
   gUDS_TxId = txId;
   gUDS_RxId = rxId;
   strncpy(gUDS_EcuQualifier, ecuQualifier, elcount(gUDS_EcuQualifier)-1);
+  gUDS_EcuQualifier[elcount(gUDS_EcuQualifier)-1] = 0;  /* null terminator 保护 */
   if (0 != diagSetTarget(gUDS_EcuQualifier))
     write("CAN_Transport: diagSetTarget失败(DLL调用可能受影响)");
   else
     write("CAN_Transport: 初始化完成, ECU=%s TxID=0x%03X RxID=0x%03X",
           gUDS_EcuQualifier, gUDS_TxId, gUDS_RxId);
+
+  /* 禁止 CANoe 诊断层自动发送 TesterPresent (3E 00)
+   * diagSetTarget 可能会激活诊断层 TP, 即使 GUI 未勾选 */
+  diagStopTesterPresent();
 }
 
 /******************************************************************************
@@ -440,15 +445,18 @@ int UDS_SendRaw()
 /******************************************************************************
  * TesterPresent 保活定时器回调
  * 每 2000ms 发送 3E 80 (suppressPositiveResponse), 保持ECU扩展会话不超时
+ *
+ * 使用功能寻址 0x7DF 而非物理寻址 (gUDS_TxId):
+ *   - 避免与物理寻址上的 ISO-TP 多帧传输冲突
+ *   - ECU 同时监听功能地址, 3E 80 能正常刷新 S3 定时器
+ *   - 即使传输中间发出也不会打断物理通道的 ISO-TP 状态机
  ******************************************************************************/
 on timer gUDS_KeepAliveTimer
 {
   message * kaMsg;
   if (!gUDS_KeepAliveActive) return;
-  if (gUDS_TxId == 0) return;
-  if (gIsoTp_TxBusy) return;  /* 多帧发送中, 跳过本次KeepAlive */
 
-  kaMsg.id      = gUDS_TxId;
+  kaMsg.id      = 0x7DF;   /* 功能寻址, 与物理通道隔离 */
   kaMsg.FDF     = gUDS_UseFD;
   kaMsg.BRS     = 0;
   kaMsg.dlc     = 8;

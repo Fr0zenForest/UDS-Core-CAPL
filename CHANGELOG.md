@@ -5,7 +5,108 @@
 
 ---
 
-## [v2.0] - 2026-03-25
+## [v2.1] - 2026-03-27
+
+### 从 SecurityFlash 下游回推合并：KeepAlive 功能寻址、缓冲区扩容、API 简化
+
+**影响范围**: 所有使用 CAN_Transport.cin + UDS_Services.cin 的项目
+
+**变更来源**: SecurityFlash 项目在实际刷写测试中发现并修复的问题，回推到上游统一。详见 `SecurityFlash/docs/SYNC_DIFF_UDS-Core-CAPL.md`。
+
+---
+
+#### Breaking Change: `UDS_SecurityAccess_RequestSeed()` 签名变更
+
+```c
+// 旧 (v1.2~v2.0) — 3参数
+int UDS_SecurityAccess_RequestSeed(byte seedOut[], int seedBufSize, int &seedActualLen);
+
+// 新 (v2.1) — 2参数
+int UDS_SecurityAccess_RequestSeed(byte seedOut[], int seedLen);
+//   seedLen=0: 自动检测，使用响应中的全部Seed长度
+//   seedLen>0: 截取到指定长度（解决部分ECU返回填充字节的问题）
+//   实际长度通过全局变量 gUDS_SeedLen 获取
+```
+
+**迁移步骤**:
+```c
+// ---- 旧代码 ----
+int seedLen;
+seedLen = 0;
+if (!UDS_SecurityAccess_RequestSeed(seedArray, elcount(seedArray), seedLen)) { ... }
+UDS_FormatHex(seedArray, seedLen, ...);
+
+// ---- 新代码 ----
+if (!UDS_SecurityAccess_RequestSeed(seedArray, 0)) { ... }
+// 使用 gUDS_SeedLen 获取实际长度
+UDS_FormatHex(seedArray, gUDS_SeedLen, ...);
+```
+
+- 使用 `UDS_SecurityAccess_Unlock()` 的上层无需修改（内部已适配）
+
+---
+
+#### 新增函数: `UDS_DiagSessionControl(byte sessionType)`
+
+通用诊断会话控制函数，支持任意 sessionType。原有 3 个便捷函数改为委托调用：
+```c
+int UDS_DiagSessionControl(byte sessionType);  // 通用 (新增)
+int UDS_DiagSessionControl_Extended();          // 委托 → UDS_DiagSessionControl(0x03)
+int UDS_DiagSessionControl_Programming();       // 委托 → UDS_DiagSessionControl(0x02)
+int UDS_DiagSessionControl_Default();           // 委托 → UDS_DiagSessionControl(0x01)
+```
+- 进入非默认会话自动 `UDS_StartKeepAlive()`，回默认会话自动 `UDS_StopKeepAlive()`
+- 支持供应商自定义会话（如 0x40、0x60 等）
+- 使用 `_Extended` / `_Programming` / `_Default` 的上层无需修改
+
+---
+
+#### CAN_Transport.cin 变更明细
+
+| # | 变更 | 级别 | 说明 |
+|---|------|------|------|
+| 1 | **KeepAlive 改为 0x7DF 功能寻址** | Bug fix | 3E 80 从物理寻址 `gUDS_TxId` 改为功能寻址 `0x7DF`，与物理通道 ISO-TP 传输隔离。删除 `gUDS_TxId==0` 和 `gIsoTp_TxBusy` 两个检查，KeepAlive 始终运行无需暂停。 |
+| 2 | **UDS_Init: strncpy null terminator** | Bug fix | `strncpy` 后显式写入 `\0`，防止 `gUDS_EcuQualifier` 缓冲区未终止。 |
+| 3 | **UDS_Init: diagStopTesterPresent()** | Bug fix | `diagSetTarget()` 后调用 `diagStopTesterPresent()`，防止 CANoe 诊断层自动发送 3E 00 与脚本的 3E 80 冲突。 |
+| 4 | **FF 接收上限跟随缓冲区** | 兼容性 | `dlen > 4096` 改为 `dlen > elcount(gUDS_RxBuf)`，与缓冲区扩容联动。 |
+
+**KeepAlive 功能寻址设计原则**:
+```
+KeepAlive (3E 80) 使用 0x7DF 功能寻址持续发送:
+  - ECU 同时监听功能地址, 3E 80 能正常刷新 S3 定时器
+  - 物理通道上的 ISO-TP 多帧传输不受影响
+  - TransferData (34/36/37) 期间无需暂停 KeepAlive
+  - NRC 0x37 惩罚等待期间无需手动发送 3E 80, 定时器已在运行
+  - 不需要 gIsoTp_TxBusy 互斥, 不需要 gUDS_TxId == 0 防护
+```
+
+---
+
+#### UDS_Services.cin 变更明细
+
+| # | 变更 | 级别 | 说明 |
+|---|------|------|------|
+| 5 | **缓冲区 4096 → 16384** | 兼容性 | `gUDS_RxBuf` / `gUDS_TxBuf` 扩大到 16KB，支持 DoIP 模式下 10KB+ 的 TransferData 块。 |
+| 6 | **P2* 超时 5000 → 10000** | 可靠性 | Flash 编程场景 ECU 擦写可能需要数秒，5000ms 不够。10000ms 经实测验证。 |
+| 7 | **新增 `gUDS_UseFD` 声明** | 正确性 | `int gUDS_UseFD = 1`，CAN_Transport.cin 已在引用此变量，声明在服务层更统一。 |
+| 8 | **新增 `gUDS_SeedLen` 声明** | 正确性 | `int gUDS_SeedLen = 0`，配合 `RequestSeed` 新签名，通过全局变量输出实际 Seed 长度。 |
+| 9 | **DiagSessionControl 通用化** | 代码质量 | 新增 `UDS_DiagSessionControl(byte sessionType)`，3 个便捷函数改为委托，消除代码重复。 |
+| 10 | **RequestSeed 改为 2 参数** | Breaking | 签名从 `(seedOut[], seedBufSize, &seedActualLen)` 改为 `(seedOut[], seedLen)`，详见上方。 |
+| 11 | **NRC 0x37 删除手动 3E 80** | Bug fix | 删除 NRC 0x37 等待循环中手动构造 CAN 报文发送 3E 80 的代码。KeepAlive 定时器已在 0x7DF 上持续发送，无需手动构造。原代码使用 `message *` 类型在 DoIP 模式下会编译失败。 |
+| 12 | **ECUReset FormatRxSummary(3)** | Bug fix | 失败时 `UDS_FormatRxSummary(2)` → `(3)`，多输出一个 NRC 字节，日志更完整。 |
+| 13 | **RoutineControl 动态上限** | 兼容性 | `payloadInLen > 4092` → `payloadInLen > elcount(gUDS_TxBuf) - 4`，与缓冲区大小解耦。 |
+| 14 | **TransferData 动态上限** | 兼容性 | `dataLen > 4094` → `dataLen > elcount(gUDS_TxBuf) - 2`，同上。 |
+
+---
+
+#### 迁移检查清单
+
+1. **使用 `UDS_SecurityAccess_RequestSeed` 的代码**: 必须适配新的 2 参数签名
+2. **使用 `UDS_SecurityAccess_Unlock` 的代码**: 无需修改
+3. **使用 `UDS_DiagSessionControl_*` 的代码**: 无需修改
+4. **依赖 `gIsoTp_TxBusy` 控制 KeepAlive 的代码**: 不再需要，可删除 Suspend/Resume 逻辑
+5. **NRC 0x37 等待期间手动发 3E 80 的代码**: 不再需要，KeepAlive 定时器自动覆盖
+6. **上层声明 `gUDS_UseFD` 的代码**: 检查是否与 UDS_Services.cin 中的声明重复
 
 ### 新增: 独立 DoIP DLL，脱离 CANoe DoIP Modeling Library 依赖
 
