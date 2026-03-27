@@ -73,7 +73,7 @@ extern "C" {
 #define DOIP_PORT                       13400
 
 /* ========== 报文最大长度 ========== */
-#define DOIP_MAX_UDS_LEN                4096
+#define DOIP_MAX_UDS_LEN                16384
 #define DOIP_MAX_MSG_LEN                (DOIP_HEADER_LEN + 4 + DOIP_MAX_UDS_LEN)
 
 /* ========== Generic Header 构建/解析 ========== */

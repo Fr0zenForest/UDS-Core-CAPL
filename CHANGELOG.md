@@ -5,6 +5,28 @@
 
 ---
 
+## [v2.2] - 2026-03-27
+
+### DoIP_Core.dll: UDS 缓冲区从 4KB 扩容到 16KB
+
+**影响范围**: 使用 `DoIP_Transport.cin` + `DoIP_Core.dll` 的所有项目
+
+**变更原因**: ECU 在 RequestDownload (0x34) 中协商的 `maxBlockLen` 可能远大于 4096（如 TBOX 协商 0x2800 = 10240）。旧 DLL 内部发送/接收缓冲区仅 4096+12 字节，导致 `DoIP_Send()` 返回 `DOIP_ERR_BUFFER (-10)` 发送失败。
+
+**变更内容**:
+| 文件 | 变更 |
+|------|------|
+| `DLL/DoIP_Core/doip_protocol.h` | `DOIP_MAX_UDS_LEN` 从 4096 → **16384**，与 CAPL 端 `gUDS_TxBuf[16384]` / `gUDS_RxBuf[16384]` 对齐 |
+| `Modules/DoIP_Core.dll` | 重新编译 |
+
+**影响的 DLL 内部缓冲区**:
+- `DoIP_Send()` 中 `msgBuf[DOIP_MAX_MSG_LEN]`（DoIP_Core.cpp:64）— 发送上限从 4108 → 16396 字节
+- `doip_tcp_recv_message()` 中 `payload[...]`（doip_tcp.cpp:345）— 接收上限同步扩大
+
+**迁移步骤**: 替换 `Modules/DoIP_Core.dll` 即可，CAPL 端无需改动。
+
+---
+
 ## [v2.1] - 2026-03-27
 
 ### 从 SecurityFlash 下游回推合并：KeepAlive 功能寻址、缓冲区扩容、API 简化
