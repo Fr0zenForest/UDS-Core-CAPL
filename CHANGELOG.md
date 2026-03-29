@@ -5,6 +5,104 @@
 
 ---
 
+## [v2.3] - 2026-03-29
+
+### 新增: DoIP_CANoe_Transport.cin — 基于 CANoe IP_Endpoint API 的 DoIP 传输层
+
+**影响范围**: 无（纯新增文件，现有传输层和上层代码无需修改）
+
+**变更来源**: SecurityFlash/doiptest 项目在实际 TBOX 诊断测试中开发并验证通过。
+
+**背景**: 原有两套传输层方案各有局限：
+- `CAN_Transport.cin` — 仅限 CAN/CAN FD 总线
+- `DoIP_Transport.cin` — 依赖自定义 `DoIP_Core.dll`（需编译/分发 DLL，且 WinSock2 阻塞模型在部分 CANoe 环境下受限）
+
+新增第三选项 `DoIP_CANoe_Transport.cin`，使用 CANoe 内置的 `IP_Endpoint` 风格 TCP API，**零外部依赖**、纯 CAPL 实现。
+
+**新增文件**:
+| 文件 | 说明 |
+|------|------|
+| `DoIP_CANoe_Transport.cin` | DoIP 传输层 — CANoe IP_Endpoint API 实现 (535 行) |
+| `experiment/doiptest/DoIP_Test.can` | VXT 测试模块示例 — DoIP UDS 诊断验证 |
+| `experiment/doiptest/DoIP_Test_TestModule.vxt` | Vector Test Automation VXT 配置 |
+
+**三套传输层对比**:
+| 维度 | CAN_Transport | DoIP_Transport (DLL) | DoIP_CANoe_Transport (新) |
+|------|--------------|---------------------|--------------------------|
+| 总线 | CAN / CAN FD | Ethernet (DoIP) | Ethernet (DoIP) |
+| 依赖 | CANoe CAN 通道 | DoIP_Core.dll (WinSock2) | CANoe IP_Endpoint API (内置) |
+| 收发模式 | ISO-TP 分帧 + 事件回调 | DLL 同步阻塞 | TCP 异步回调 + 手动 arm |
+| KeepAlive | 功能寻址 0x7DF CAN 帧 | DLL 后台线程 | CAPL msTimer + DoIP 封装 |
+| 外部依赖 | 无 | DoIP_Core.dll | 无 |
+| 适用场景 | CAN 总线诊断 | 无 CANoe DoIP 建模需求 | 有 CANoe 以太网通道配置 |
+
+**关键实现细节**:
+
+1. **IP_Endpoint API (非数值 IP API)**
+   - `TcpOpen(IP_Endpoint)` 而非 `TcpOpen(ipNum, port)`
+   - `TcpConnect(socket, IP_Endpoint)` 而非 `TcpConnect(socket, ipNum, port)`
+   - 接收回调 `OnTcpReceive(socket, result, IP_Endpoint, char[], size)` 而非 `(socket, result, dword, dword, byte[], size)`
+   - **重要**: 数值 IP API 在部分 CANoe 配置下 TCP 连接超时失败，IP_Endpoint API 经实测可靠
+
+2. **手动 TcpReceive arm 机制**
+   - IP_Endpoint API 不自动接收，需在连接成功后和每次 `OnTcpReceive` 回调中调用 `TcpReceive(socket, charBuf, size)` 重新 arm
+   - 遗漏 re-arm 将导致后续数据丢失
+
+3. **char[] ↔ byte[] 缓冲区转换**
+   - IP_Endpoint API 收发使用 `char[]`，DoIP 帧解析使用 `byte[]`
+   - 接收: `OnTcpReceive` 中逐字节 `(byte)buffer[i]` 转入拼包缓冲区
+   - 发送: `DoIP_TcpSendBytes()` 辅助函数通过 `memcpy` 将 `byte[]` 转为 `char[]` 后调用 `TcpSend`
+
+4. **TCP 流拼包**
+   - TCP 是字节流，可能一次收到不足一个 DoIP 帧或包含多个帧
+   - 使用 `gDoIP_RxBuf[16400]` + `gDoIP_RxPos` 实现拼包状态机
+   - 先收齐 8 字节 DoIP Header，解析 `payloadLen`，再等齐完整帧
+
+5. **DoIP 协议帧手动构建/解析 (ISO 13400-2)**
+   - `DoIP_BuildHeader()` / `DoIP_ParseHeader()` — 通用 8 字节 Header
+   - `DoIP_BuildRoutingActReq()` — Routing Activation (0x0005)
+   - `DoIP_BuildDiagMsg()` — Diagnostic Message (0x8001)
+   - `DoIP_BuildAliveCheckResp()` — Alive Check Response (0x0008)
+   - `DoIP_HandleFrame()` — 帧分发: RA Response / Diag Msg / Pos/Neg ACK / Alive Check
+
+6. **统一接口**: `UDS_Init()` / `UDS_SendRaw()` / `UDS_StartKeepAlive()` / `UDS_StopKeepAlive()` 签名与其他传输层完全一致，上层代码零修改
+
+**配置方法**:
+```c
+/* 上层 .can 文件中配置 */
+char   gDoIP_LocalIp[32]  = "192.168.69.21";   // 本机 IP
+char   gDoIP_EcuIp[32]    = "192.168.69.1";    // ECU IP
+dword  gDoIP_TesterAddr   = 0x0002;             // Tester 逻辑地址
+dword  gDoIP_EcuAddr      = 0x0001;             // ECU 逻辑地址
+```
+
+**使用方法** (在 .can 文件的 includes 区域三选一):
+```c
+includes
+{
+  /* A) CANoe IP_Endpoint API (新增) */
+  #include "DoIP_CANoe_Transport.cin"
+
+  /* B) 自定义 DoIP DLL */
+  //#pragma library("./Modules/DoIP_Core.dll")
+  //#include "DoIP_Transport.cin"
+
+  /* C) CAN/CAN FD ISO-TP */
+  //#include "CAN_Transport.cin"
+
+  /* UDS 服务层 (必须在传输层之后) */
+  #include "UDS_Services.cin"
+}
+```
+
+**迁移步骤**: 上层测试脚本**无需任何修改**。只需:
+1. 将 `DoIP_CANoe_Transport.cin` 放到工程目录
+2. 在 `.can` 文件中 `#include "DoIP_CANoe_Transport.cin"` 替换原有传输层
+3. 配置 `gDoIP_*` 参数
+4. CANoe 中配好以太网通道和 IP 地址
+
+---
+
 ## [v2.2] - 2026-03-27
 
 ### DoIP_Core.dll: UDS 缓冲区从 4KB 扩容到 16KB

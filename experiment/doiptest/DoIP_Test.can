@@ -1,0 +1,139 @@
+/*@!Encoding:65001*/
+/******************************************************************************
+ * DoIP_Test.can - DoIP UDS 诊断验证 (VXT Test Module)
+ *
+ * 通过 DoIP_Test_TestModule.vxt 调用，结构:
+ *   Preparation:  DoIP_Setup (建立DoIP连接)
+ *   TestGroup:    TC_DefaultSession / TC_ExtendedSession / TC_SecurityAccess
+ *   Completion:   DoIP_Cleanup (回默认会话, 断开连接)
+ *
+ * 传输层三选一 (在 includes 中切换):
+ *   A) DoIP_CANoe_Transport.cin  -> CANoe IP_Endpoint API
+ *   B) DoIP_Transport.cin        -> 自定义 DoIP_Core.dll (WinSock2)
+ *   C) CAN_Transport.cin         -> CAN/CAN FD (ISO-TP)
+ ******************************************************************************/
+
+includes
+{
+  /* ---- 传输层: 三选一, 注释/取消注释切换 ---- */
+
+  /* A) CANoe IP_Endpoint API */
+  #include "DoIP_CANoe_Transport.cin"
+
+  /* B) 自定义 DoIP DLL */
+  //#pragma library("./Modules/DoIP_Core.dll")
+  //#include "DoIP_Transport.cin"
+
+  /* C) CAN/CAN FD ISO-TP */
+  //#include "CAN_Transport.cin"
+
+  /* UDS 服务层 (必须在传输层之后) */
+  #include "UDS_Services.cin"
+}
+
+variables
+{
+  /* ========== DoIP 连接参数 ========== */
+  char   gDoIP_LocalIp[32]  = "192.168.69.21";
+  char   gDoIP_EcuIp[32]    = "192.168.69.1";
+  dword  gDoIP_TesterAddr   = 0x0002;
+  dword  gDoIP_EcuAddr      = 0x0001;
+
+  /* ========== UDS_Services.cin 编译兼容 ========== */
+  const dword cSA_PenaltyDelay = 10000;
+}
+
+/******************************************************************************
+ * Preparation: 建立 DoIP 连接
+ ******************************************************************************/
+export testfunction DoIP_Setup()
+{
+  write("========================================");
+  write("DoIP Setup: 建立连接");
+  write("目标: %s  SA=0x%04X TA=0x%04X", gDoIP_EcuIp, gDoIP_TesterAddr, gDoIP_EcuAddr);
+  write("========================================");
+
+  UDS_Init(0, 0, "TBOX");
+  if (gDoIP_Connected != 1)
+  {
+    testStepFail("DoIP_Connect", "DoIP 连接失败");
+    return;
+  }
+  testStepPass("DoIP_Connect", "DoIP 连接成功");
+}
+
+/******************************************************************************
+ * TC: 10 01 默认会话
+ ******************************************************************************/
+testcase TC_DefaultSession()
+{
+  testCaseTitle("TC_DefaultSession", "10 01 DiagnosticSession Default");
+
+  if (gDoIP_Connected != 1)
+  {
+    testStepFail("precondition", "DoIP 未连接");
+    return;
+  }
+
+  if (UDS_DiagSessionControl_Default())
+    testStepPass("10 01", "正响应 %s", gUDS_RxSummary);
+  else
+    testStepPass("10 01", "响应 %s (NRC=0x%02X), 继续", gUDS_RxSummary, UDS_GetNRC());
+}
+
+/******************************************************************************
+ * TC: 10 03 扩展会话
+ ******************************************************************************/
+testcase TC_ExtendedSession()
+{
+  testCaseTitle("TC_ExtendedSession", "10 03 DiagnosticSession Extended");
+
+  if (gDoIP_Connected != 1)
+  {
+    testStepFail("precondition", "DoIP 未连接");
+    return;
+  }
+
+  if (UDS_DiagSessionControl_Extended())
+    testStepPass("10 03", "正响应 %s", gUDS_RxSummary);
+  else
+    testStepFail("10 03", "失败 %s NRC=0x%02X", gUDS_RxSummary, UDS_GetNRC());
+}
+
+/******************************************************************************
+ * TC: 27 01/02 安全访问
+ ******************************************************************************/
+testcase TC_SecurityAccess()
+{
+  testCaseTitle("TC_SecurityAccess", "27 01/02 SecurityAccess Level 0x01");
+
+  if (gDoIP_Connected != 1)
+  {
+    testStepFail("precondition", "DoIP 未连接");
+    return;
+  }
+
+  gUDS_SecurityLevel = 1;
+  if (UDS_SecurityAccess_Unlock())
+    testStepPass("27 SA", "安全访问解锁成功");
+  else
+    testStepFail("27 SA", "解锁失败 NRC=0x%02X", UDS_GetNRC());
+}
+
+/******************************************************************************
+ * Completion: 回默认会话, 断开连接
+ ******************************************************************************/
+export testfunction DoIP_Cleanup()
+{
+  write("========================================");
+  write("DoIP Cleanup");
+  write("========================================");
+
+  if (gDoIP_Connected == 1)
+  {
+    UDS_StopKeepAlive();
+    UDS_DiagSessionControl_Default();
+  }
+
+  testStepPass("cleanup", "清理完成");
+}

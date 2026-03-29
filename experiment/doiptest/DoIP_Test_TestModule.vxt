@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="gb2312"?>
+<!--Vector Test Automation Editor-->
+<testmodule title="DoIP UDS Diagnostic Test" version="1.0" xmlns="http://www.vector-informatik.de/CANoe/TestModule/1.27">
+
+  <preparation>
+    <capltestfunction name="DoIP_Setup" title="DoIP Connect + Routing Activation" />
+  </preparation>
+
+  <testgroup title="UDS Diagnostic Tests">
+    <capltestcase name="TC_DefaultSession"
+                  title="10 01 DiagnosticSession Default" />
+    <capltestcase name="TC_ExtendedSession"
+                  title="10 03 DiagnosticSession Extended" />
+    <capltestcase name="TC_SecurityAccess"
+                  title="27 01/02 SecurityAccess Level 0x01" />
+  </testgroup>
+
+  <completion>
+    <capltestfunction name="DoIP_Cleanup" title="Cleanup" />
+  </completion>
+
+</testmodule>
