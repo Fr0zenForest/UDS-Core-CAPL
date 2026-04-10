@@ -5,6 +5,22 @@
 
 ---
 
+## [v2.3.1] - 2026-04-10
+
+### 修复: 超时常量类型 int → long，防止溢出
+
+**影响范围**: `UDS_Services.cin` 超时常量声明
+
+**背景**: CAPL 中 `int` 为 16 位有符号 (-32768~32767)。当前值 5000/10000 未溢出，但若后续调大超过 32767 会静默溢出为负数，导致 `testWaitForTextEvent` 超时失效（实际等待 ~49.7 天）。SecurityAccess2.0 项目已因此踩坑。
+
+**变更文件**:
+| 文件 | 行 | 修改前 | 修改后 |
+|------|-----|--------|--------|
+| `UDS_Services.cin` | 29 | `const int  cUDS_DefaultTimeout = 5000;` | `const long cUDS_DefaultTimeout = 5000;` |
+| `UDS_Services.cin` | 30 | `const int  cUDS_P2StarTimeout  = 10000;` | `const long cUDS_P2StarTimeout  = 10000;` |
+
+---
+
 ## [v2.3] - 2026-03-29
 
 ### 新增: DoIP_CANoe_Transport.cin — 基于 CANoe IP_Endpoint API 的 DoIP 传输层

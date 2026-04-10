@@ -26,8 +26,8 @@ variables
   int   gUDS_TxLen;
 
   /* ========== 超时 ========== */
-  const int  cUDS_DefaultTimeout = 5000;
-  const int  cUDS_P2StarTimeout  = 10000;  /* NRC 0x78 Pending等待间隔, Flash编程期间ECU可能需要较长处理时间 */
+  const long cUDS_DefaultTimeout = 5000;
+  const long cUDS_P2StarTimeout  = 10000;  /* NRC 0x78 Pending等待间隔, Flash编程期间ECU可能需要较长处理时间 */
 
   /* ========== 请求间隔 ========== */
   const int  cUDS_InterReqDelay  = 100;   /* ms, 避免ECU来不及切换状态 */
