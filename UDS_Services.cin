@@ -39,6 +39,7 @@ variables
   /* ========== ECU配置 ========== */
   char  gUDS_EcuQualifier[64]  = "";        /* UDS_Init()设置 */
   dword gUDS_SecurityLevel     = 1;
+  char  gUDS_SeedKeyDllPath[512] = "";      /* Seed&Key DLL路径, 调用前必须设置 */
 
   /* ========== 测试步骤 ========== */
   char  gStepId[32];
@@ -191,11 +192,16 @@ int UDS_SecurityAccess_RequestSeed(byte seedOut[], int seedBufSize, int &seedAct
         }
         else
         {
-          /* DoIP 模式: 通过 DLL 发送 3E 80 */
+          /* DoIP 模式: 通过 IP_Endpoint API 发送 DoIP 封装的 3E 80 */
           byte tpBuf[2];
+          byte doipTp[20];
+          int  doipTpLen;
           tpBuf[0] = 0x3E;
           tpBuf[1] = 0x80;
-          DoIP_Send(gDoIP_EcuAddr, tpBuf, 2);
+          doipTpLen = DoIP_BuildDiagMsg(doipTp, elcount(doipTp),
+                                        gDoIP_TesterAddr, gDoIP_EcuAddr, tpBuf, 2);
+          if (doipTpLen > 0)
+            DoIP_TcpSendBytes(doipTp, (dword)doipTpLen);
         }
         if (waitRemain > 1000)
           testWaitForTimeout(1000);
@@ -243,28 +249,31 @@ int UDS_SecurityAccess_SendKey(byte keyData[], int keyLen)
 }
 
 /******************************************************************************
- * 通过注册的 Seed&Key DLL 计算Key
+ * 通过 SecurityKeyBridge.dll 动态加载 Seed&Key DLL 计算Key
+ * 需要在 .can 文件 includes 中声明:
+ *   #pragma library("./Modules/SecurityKeyBridge.dll")
+ * 调用前需设置 gUDS_SeedKeyDllPath 为 Seed&Key DLL 的完整路径
  ******************************************************************************/
 int UDS_GenerateKeyFromSeed(byte seedData[], dword seedLen,
                              byte keyOut[], dword keyBufSize, dword &keyOutLen)
 {
-  long  ret;
-  dword actualSize;
+  long ret;
 
-  actualSize = 0;
-  ret = diagGenerateKeyFromSeed(
-            gUDS_EcuQualifier,
-            seedData, seedLen,
-            gUDS_SecurityLevel,
-            "", "",
-            keyOut, keyBufSize, actualSize);
-
-  if (ret != 0)
+  if (strlen(gUDS_SeedKeyDllPath) == 0)
   {
-    write("UDS_Services: diagGenerateKeyFromSeed失败 ret=%d", ret);
+    write("UDS_Services: ERROR - gUDS_SeedKeyDllPath未设置");
     return 0;
   }
-  keyOutLen = actualSize;
+
+  ret = SK_GenerateKey(gUDS_SeedKeyDllPath, seedData, (long)seedLen,
+                       (long)gUDS_SecurityLevel, keyOut, (long)keyBufSize);
+
+  if (ret <= 0)
+  {
+    write("UDS_Services: SK_GenerateKey失败 ret=%d (-1=空路径 -2=LoadLibrary失败 -3=函数未找到 -4=计算错误)", ret);
+    return 0;
+  }
+  keyOutLen = (dword)ret;
   write("UDS_Services: Key计算成功 keyLen=%d", keyOutLen);
   return 1;
 }

@@ -1,22 +1,23 @@
 /*@!Encoding:65001*/
 /******************************************************************************
- * UDS_Transport.cin - CAN/DoIP 双模传输层 (实验性)
+ * UDS_Transport.cin - CAN/DoIP 双模传输层
  *
- * 合并 CAN_Transport.cin 和 DoIP_Transport.cin，通过 gUDS_CommMode 变量
+ * 合并 CAN_Transport 和 DoIP_Transport，通过 gUDS_CommMode 变量
  * 在运行时选择底层传输方式:
  *   gUDS_CommMode = 0 → CAN (ISO-TP)
- *   gUDS_CommMode = 1 → DoIP (TCP/IP, 自定义 DoIP_Core.dll)
+ *   gUDS_CommMode = 1 → DoIP (CANoe IP_Endpoint API, Trace可见)
  *
  * 对外接口:
  *   UDS_Init(txId, rxId, ecuQualifier)  初始化传输通道
  *   UDS_SendRaw()                       发送UDS请求并等待响应
  *   UDS_StartKeepAlive()                启动TesterPresent保活
  *   UDS_StopKeepAlive()                 停止TesterPresent保活
+ *   UDS_Reconnect()                     DoIP重连(ECU复位后)
  *
  * 使用方法:
  *   .can 文件中:
  *     includes {
- *       #pragma library("./Modules/DoIP_Core.dll")
+ *       #pragma library("./Modules/SecurityKeyBridge.dll")
  *       #include "UDS_Transport.cin"
  *       #include "UDS_Services.cin"
  *     }
@@ -24,7 +25,7 @@
  *
  * 注意:
  *   - gUDS_CommMode 应在 UDS_Init() 之前设置
- *   - DoIP_Core.dll 总是加载，但 CAN 模式下不会被调用
+ *   - DoIP 模式使用 CANoe IP_Endpoint TCP API，无需外部 DLL
  *   - on message 回调总是注册，但 DoIP 模式下 gUDS_RxId=0 自动跳过
  ******************************************************************************/
 
@@ -36,6 +37,31 @@ variables
 
   /* ========== DoIP 连接状态 ========== */
   int   gDoIP_Connected = 0;         /* 0=未连接, 1=已连接, -1=连接失败 */
+  dword gDoIP_Socket    = 0;         /* TCP socket handle */
+
+  /* ========== DoIP 协议常量 ========== */
+  const byte  cDoIP_Version     = 0x02;
+  const byte  cDoIP_InvVersion  = 0xFD;
+  const dword cDoIP_Port        = 13400;
+  const int   cDoIP_HeaderLen   = 8;
+
+  /* DoIP Payload Types */
+  const word  cDoIP_RoutingActReq   = 0x0005;
+  const word  cDoIP_RoutingActResp  = 0x0006;
+  const word  cDoIP_DiagMessage     = 0x8001;
+  const word  cDoIP_DiagPosAck      = 0x8002;
+  const word  cDoIP_DiagNegAck      = 0x8003;
+  const word  cDoIP_AliveCheckReq   = 0x0007;
+  const word  cDoIP_AliveCheckResp  = 0x0008;
+
+  /* ========== DoIP 接收缓冲区 ========== */
+  char  gDoIP_CharRxBuf[16400];      /* IP_Endpoint API 要求 char[] */
+  byte  gDoIP_RxBuf[16400];          /* DoIP 帧拼包缓冲区 */
+  dword gDoIP_RxPos = 0;
+
+  /* ========== DoIP 重连参数 ========== */
+  const long  cDoIP_ReconnectMaxWait  = 30000;  /* 重连最长等待 ms */
+  const long  cDoIP_ReconnectInterval = 2000;   /* 重连重试间隔 ms */
 
   /* ========== ISO-TP 接收状态机 ========== */
   dword gIsoTp_RxExpected;
@@ -56,6 +82,211 @@ variables
 
   /* ========== ISO-TP 多帧互斥锁 ========== */
   int     gIsoTp_TxBusy = 0;
+}
+
+/*=============================================================================
+ *
+ *   DoIP (CANoe IP_Endpoint API) 传输层内部函数
+ *
+ *=============================================================================*/
+
+/******************************************************************************
+ * DoIP 帧构建辅助函数
+ ******************************************************************************/
+void DoIP_BuildHeader(byte buf[], word payloadType, dword payloadLen)
+{
+  buf[0] = cDoIP_Version;
+  buf[1] = cDoIP_InvVersion;
+  buf[2] = (byte)((payloadType >> 8) & 0xFF);
+  buf[3] = (byte)(payloadType & 0xFF);
+  buf[4] = (byte)((payloadLen >> 24) & 0xFF);
+  buf[5] = (byte)((payloadLen >> 16) & 0xFF);
+  buf[6] = (byte)((payloadLen >> 8) & 0xFF);
+  buf[7] = (byte)(payloadLen & 0xFF);
+}
+
+int DoIP_ParseHeader(byte buf[], dword bufLen, word &payloadType, dword &payloadLen)
+{
+  if (bufLen < 8) return -1;
+  if ((buf[0] ^ 0xFF) != buf[1]) return -2;
+  payloadType = ((word)buf[2] << 8) | (word)buf[3];
+  payloadLen  = ((dword)buf[4] << 24) | ((dword)buf[5] << 16)
+              | ((dword)buf[6] << 8)  | (dword)buf[7];
+  return 0;
+}
+
+int DoIP_BuildRoutingActReq(byte buf[], dword bufSize, dword testerAddr)
+{
+  if (bufSize < 15) return -1;
+  DoIP_BuildHeader(buf, cDoIP_RoutingActReq, 7);
+  buf[8]  = (byte)((testerAddr >> 8) & 0xFF);
+  buf[9]  = (byte)(testerAddr & 0xFF);
+  buf[10] = 0x00;  /* Activation Type: Default */
+  buf[11] = 0x00;  buf[12] = 0x00;  buf[13] = 0x00;  buf[14] = 0x00;
+  return 15;
+}
+
+int DoIP_BuildDiagMsg(byte buf[], dword bufSize,
+                      dword srcAddr, dword tgtAddr,
+                      byte udsData[], int udsLen)
+{
+  dword payloadLen;
+  int totalLen, i;
+  payloadLen = 4 + udsLen;
+  totalLen   = 8 + payloadLen;
+  if (bufSize < totalLen) return -1;
+  DoIP_BuildHeader(buf, cDoIP_DiagMessage, payloadLen);
+  buf[8]  = (byte)((srcAddr >> 8) & 0xFF);
+  buf[9]  = (byte)(srcAddr & 0xFF);
+  buf[10] = (byte)((tgtAddr >> 8) & 0xFF);
+  buf[11] = (byte)(tgtAddr & 0xFF);
+  for (i = 0; i < udsLen; i++)
+    buf[12 + i] = udsData[i];
+  return totalLen;
+}
+
+int DoIP_BuildAliveCheckResp(byte buf[], dword bufSize, dword testerAddr)
+{
+  if (bufSize < 10) return -1;
+  DoIP_BuildHeader(buf, cDoIP_AliveCheckResp, 2);
+  buf[8] = (byte)((testerAddr >> 8) & 0xFF);
+  buf[9] = (byte)(testerAddr & 0xFF);
+  return 10;
+}
+
+void DoIP_TcpSendBytes(byte data[], dword len)
+{
+  char sendBuf[16400];
+  memcpy(sendBuf, data, len);
+  TcpSend(gDoIP_Socket, sendBuf, len);
+}
+
+/******************************************************************************
+ * TCP 回调: 连接结果
+ ******************************************************************************/
+void OnTcpConnect(dword socket, long result)
+{
+  if (socket != gDoIP_Socket) return;
+  if (result != 0)
+  {
+    write("DoIP_TCP: connect failed, result=%d", result);
+    gDoIP_Connected = -1;
+    testSupplyTextEvent("DoIP_ConnectResult");
+    return;
+  }
+  write("DoIP_TCP: TCP connected, arming receive and sending Routing Activation...");
+  TcpReceive(socket, gDoIP_CharRxBuf, elcount(gDoIP_CharRxBuf));
+  {
+    byte raBuf[15];
+    int  raLen;
+    raLen = DoIP_BuildRoutingActReq(raBuf, elcount(raBuf), gDoIP_TesterAddr);
+    if (raLen > 0)
+      DoIP_TcpSendBytes(raBuf, (dword)raLen);
+    else
+    { write("DoIP_TCP: build RA request failed"); gDoIP_Connected = -1; testSupplyTextEvent("DoIP_ConnectResult"); }
+  }
+}
+
+/******************************************************************************
+ * TCP 回调: 数据接收 (IP_Endpoint API, 流式拼包)
+ ******************************************************************************/
+void OnTcpReceive(dword socket, long result, IP_Endpoint remoteEndpoint,
+                  char buffer[], dword size)
+{
+  dword i;
+  word  payloadType;
+  dword payloadLen, frameLen;
+
+  if (socket != gDoIP_Socket) return;
+  if (result != 0)
+  { write("DoIP_TCP: recv error result=%d", result); gDoIP_Connected = -1; return; }
+
+  for (i = 0; i < size && gDoIP_RxPos < elcount(gDoIP_RxBuf); i++)
+    gDoIP_RxBuf[gDoIP_RxPos++] = (byte)buffer[i];
+
+  while (gDoIP_RxPos >= 8)
+  {
+    if (DoIP_ParseHeader(gDoIP_RxBuf, gDoIP_RxPos, payloadType, payloadLen) != 0)
+    { write("DoIP_TCP: bad header, reset buffer"); gDoIP_RxPos = 0;
+      TcpReceive(socket, gDoIP_CharRxBuf, elcount(gDoIP_CharRxBuf)); return; }
+    frameLen = 8 + payloadLen;
+    if (gDoIP_RxPos < frameLen)
+    { TcpReceive(socket, gDoIP_CharRxBuf, elcount(gDoIP_CharRxBuf)); return; }
+    DoIP_HandleFrame(payloadType, gDoIP_RxBuf, frameLen);
+    if (gDoIP_RxPos > frameLen)
+    { for (i = 0; i < gDoIP_RxPos - frameLen; i++) gDoIP_RxBuf[i] = gDoIP_RxBuf[frameLen + i];
+      gDoIP_RxPos = gDoIP_RxPos - frameLen; }
+    else
+      gDoIP_RxPos = 0;
+  }
+  TcpReceive(socket, gDoIP_CharRxBuf, elcount(gDoIP_CharRxBuf));
+}
+
+void OnTcpClose(dword socket, long result)
+{
+  if (socket != gDoIP_Socket) return;
+  write("DoIP_TCP: connection closed, result=%d", result);
+  gDoIP_Connected = -1;
+}
+
+/******************************************************************************
+ * DoIP 帧分发处理
+ ******************************************************************************/
+void DoIP_HandleFrame(word payloadType, byte frame[], dword frameLen)
+{
+  dword payloadLen, udsLen, i;
+  word  srcAddr, tgtAddr;
+  byte  respCode, ackCode;
+
+  payloadLen = frameLen - 8;
+
+  switch (payloadType)
+  {
+    case 0x0006:  /* Routing Activation Response */
+      if (payloadLen < 5)
+      { write("DoIP_TCP: RA response too short (%d)", payloadLen);
+        gDoIP_Connected = -1; testSupplyTextEvent("DoIP_ConnectResult"); return; }
+      srcAddr  = ((word)frame[8] << 8) | (word)frame[9];
+      tgtAddr  = ((word)frame[10] << 8) | (word)frame[11];
+      respCode = frame[12];
+      if (respCode == 0x10)
+      { write("DoIP_TCP: Routing Activation OK (tester=0x%04X entity=0x%04X)", srcAddr, tgtAddr);
+        gDoIP_Connected = 1; }
+      else
+      { write("DoIP_TCP: Routing Activation FAILED code=0x%02X", respCode);
+        gDoIP_Connected = -1; }
+      testSupplyTextEvent("DoIP_ConnectResult");
+      break;
+
+    case 0x8001:  /* Diagnostic Message */
+      if (payloadLen < 5) return;
+      udsLen = payloadLen - 4;
+      if (udsLen > elcount(gUDS_RxBuf)) udsLen = elcount(gUDS_RxBuf);
+      for (i = 0; i < udsLen; i++)
+        gUDS_RxBuf[i] = frame[12 + i];
+      gUDS_RxLen = udsLen; gUDS_RxReady = 1;
+      testSupplyTextEvent("UDS_RxDone");
+      break;
+
+    case 0x8002:  /* Diagnostic Positive ACK */
+      break;
+
+    case 0x8003:  /* Diagnostic Negative ACK */
+      if (payloadLen >= 5)
+      { ackCode = frame[12]; write("DoIP_TCP: Diagnostic NACK code=0x%02X", ackCode); }
+      gUDS_RxReady = -1; testSupplyTextEvent("UDS_RxDone");
+      break;
+
+    case 0x0007:  /* Alive Check Request */
+    { byte acBuf[10]; int acLen;
+      acLen = DoIP_BuildAliveCheckResp(acBuf, elcount(acBuf), gDoIP_TesterAddr);
+      if (acLen > 0) DoIP_TcpSendBytes(acBuf, (dword)acLen);
+      write("DoIP_TCP: Alive Check -> responded"); break; }
+
+    default:
+      write("DoIP_TCP: unknown payload type 0x%04X len=%d", payloadType, payloadLen);
+      break;
+  }
 }
 
 /*=============================================================================
@@ -303,48 +534,51 @@ int UDS_SendRaw_CAN()
 }
 
 /******************************************************************************
- * DoIP: 发送原始UDS请求并等待响应
+ * DoIP: 发送原始UDS请求并等待响应 (CANoe IP_Endpoint API)
  ******************************************************************************/
 int UDS_SendRaw_DoIP()
 {
-  long  ret;
   int   txLen;
   dword t0, elapsedMs;
+  byte  doipBuf[16400];
+  int   doipLen;
 
-  if (gDoIP_Connected != 1) { write("DoIP: 未连接"); return -1; }
+  if (gDoIP_Connected != 1) { write("DoIP_TCP: not connected"); return -1; }
 
-  txLen = gUDS_TxLen; gUDS_RxReady = 0; gUDS_RxLen = 0;
+  gUDS_RxReady = 0; gUDS_RxLen = 0;
+  txLen = gUDS_TxLen;
+
   testWaitForTextEvent("__delay__", cUDS_InterReqDelay);
 
   UDS_FormatHex(gUDS_TxBuf, txLen, gUDS_HexBuf, elcount(gUDS_HexBuf));
   t0 = timeNow();
-  write("TX [DoIP→0x%04X] %d bytes: %s", gDoIP_EcuAddr, txLen, gUDS_HexBuf);
+  write("TX [DoIP->0x%04X] %d bytes: %s", gDoIP_EcuAddr, txLen, gUDS_HexBuf);
 
-  ret = DoIP_Send(gDoIP_EcuAddr, gUDS_TxBuf, (dword)txLen);
-  if (ret != 0)
-  { elapsedMs = (timeNow() - t0) / 100; write("TX [DoIP] ERROR ret=%d (%dms)", ret, elapsedMs); return -1; }
+  doipLen = DoIP_BuildDiagMsg(doipBuf, elcount(doipBuf),
+                              gDoIP_TesterAddr, gDoIP_EcuAddr,
+                              gUDS_TxBuf, txLen);
+  if (doipLen <= 0) { write("DoIP_TCP: build diag msg failed"); return -1; }
+  DoIP_TcpSendBytes(doipBuf, (dword)doipLen);
 
-  ret = DoIP_Recv(gUDS_RxBuf, elcount(gUDS_RxBuf), cUDS_DefaultTimeout);
-  if (ret <= 0)
-  { elapsedMs = (timeNow() - t0) / 100;
-    if (ret == 0) write("RX [DoIP] TIMEOUT (%dms)", elapsedMs);
-    else write("RX [DoIP] ERROR ret=%d (%dms)", ret, elapsedMs);
-    return (ret == 0) ? 0 : -1; }
-  gUDS_RxLen = ret; gUDS_RxReady = 1;
+  if (testWaitForTextEvent("UDS_RxDone", cUDS_DefaultTimeout) == 0)
+  { elapsedMs = (timeNow() - t0) / 100; write("RX [DoIP<-0x%04X] TIMEOUT %dms", gDoIP_EcuAddr, elapsedMs); return 0; }
+  if (gUDS_RxReady != 1)
+  { elapsedMs = (timeNow() - t0) / 100; write("RX [DoIP<-0x%04X] ERROR (%dms)", gDoIP_EcuAddr, elapsedMs); return -1; }
 
   elapsedMs = (timeNow() - t0) / 100;
   UDS_FormatHex(gUDS_RxBuf, gUDS_RxLen, gUDS_HexBuf, elcount(gUDS_HexBuf));
-  write("RX [DoIP←0x%04X] %d bytes (%dms): %s", gDoIP_EcuAddr, gUDS_RxLen, elapsedMs, gUDS_HexBuf);
+  write("RX [DoIP<-0x%04X] %d bytes (%dms): %s", gDoIP_EcuAddr, gUDS_RxLen, elapsedMs, gUDS_HexBuf);
 
   while (gUDS_RxLen >= 3 && gUDS_RxBuf[0] == 0x7F && gUDS_RxBuf[2] == 0x78)
   {
-    write("RX [DoIP] NRC 0x78 Pending...");
-    ret = DoIP_Recv(gUDS_RxBuf, elcount(gUDS_RxBuf), cUDS_P2StarTimeout);
-    if (ret <= 0) { elapsedMs = (timeNow() - t0) / 100; write("RX [DoIP] P2*超时 (%dms)", elapsedMs); return 0; }
-    gUDS_RxLen = ret; gUDS_RxReady = 1;
+    write("RX [DoIP<-0x%04X] NRC 0x78 Pending, waiting...", gDoIP_EcuAddr);
+    gUDS_RxReady = 0; gUDS_RxLen = 0;
+    if (testWaitForTextEvent("UDS_RxDone", cUDS_P2StarTimeout) == 0)
+    { elapsedMs = (timeNow() - t0) / 100; write("RX [DoIP<-0x%04X] P2* TIMEOUT %dms", gDoIP_EcuAddr, elapsedMs); return 0; }
+    if (gUDS_RxReady != 1) return 0;
     elapsedMs = (timeNow() - t0) / 100;
     UDS_FormatHex(gUDS_RxBuf, gUDS_RxLen, gUDS_HexBuf, elcount(gUDS_HexBuf));
-    write("RX [DoIP←0x%04X] %d bytes (%dms): %s", gDoIP_EcuAddr, gUDS_RxLen, elapsedMs, gUDS_HexBuf);
+    write("RX [DoIP<-0x%04X] %d bytes (%dms): %s", gDoIP_EcuAddr, gUDS_RxLen, elapsedMs, gUDS_HexBuf);
   }
   return 1;
 }
@@ -357,8 +591,6 @@ int UDS_SendRaw_DoIP()
 
 void UDS_Init(dword txId, dword rxId, char ecuQualifier[])
 {
-  long ret;
-
   strncpy(gUDS_EcuQualifier, ecuQualifier, elcount(gUDS_EcuQualifier)-1);
   if (0 != diagSetTarget(gUDS_EcuQualifier))
     write("UDS_Transport: diagSetTarget失败");
@@ -367,16 +599,57 @@ void UDS_Init(dword txId, dword rxId, char ecuQualifier[])
 
   if (gUDS_CommMode == 1)
   {
+    IP_Endpoint localEp;
+    IP_Endpoint remoteEp;
+    long  result;
+    char  errorText[200];
+
     /* DoIP 模式: 清零 CAN ID, 防止 on message 回调误触发 */
     gUDS_TxId = 0;
     gUDS_RxId = 0;
-    DoIP_CreateConnection(gDoIP_LocalIp, gDoIP_EcuIp, gDoIP_TesterAddr, gDoIP_EcuAddr);
-    DoIP_SetTimeout(5000, 5000);
-    write("UDS_Transport [DoIP]: 正在连接 %s ...", gDoIP_EcuIp);
-    ret = DoIP_Connect();
-    if (ret != 0) { write("UDS_Transport [DoIP]: 连接失败! err=%d", ret); gDoIP_Connected = -1; return; }
-    gDoIP_Connected = 1;
-    write("UDS_Transport [DoIP]: 连接成功 ECU=%s IP=%s SA=0x%04X TA=0x%04X",
+
+    localEp.ParseEndpointFromString(gDoIP_LocalIp);
+    localEp.PortNumber = 0;
+    gDoIP_Socket = TcpOpen(localEp);
+    write("DoIP_TCP: TcpOpen(%s:0) -> socket=0x%08X", gDoIP_LocalIp, gDoIP_Socket);
+
+    if (IpGetLastSocketError(gDoIP_Socket) != 0)
+    {
+      IpGetLastSocketErrorAsString(gDoIP_Socket, errorText, elcount(errorText));
+      write("DoIP_TCP: TcpOpen FAILED: %s", errorText);
+      gDoIP_Connected = -1;
+      gDoIP_Socket = 0;
+      return;
+    }
+
+    gDoIP_Connected = 0;
+    gDoIP_RxPos     = 0;
+
+    remoteEp.ParseEndpointFromString(gDoIP_EcuIp);
+    remoteEp.PortNumber = cDoIP_Port;
+    write("DoIP_TCP: connecting to %s:%d ...", gDoIP_EcuIp, cDoIP_Port);
+    result = TcpConnect(gDoIP_Socket, remoteEp);
+
+    if (result != 0 && IpGetLastSocketError(gDoIP_Socket) != 10035)
+    {
+      IpGetLastSocketErrorAsString(gDoIP_Socket, errorText, elcount(errorText));
+      write("DoIP_TCP: TcpConnect FAILED: %s", errorText);
+      TcpClose(gDoIP_Socket);
+      gDoIP_Socket = 0;
+      gDoIP_Connected = -1;
+      return;
+    }
+
+    if (testWaitForTextEvent("DoIP_ConnectResult", 10000) == 0 || gDoIP_Connected != 1)
+    {
+      write("DoIP_TCP: connect/routing activation failed!");
+      TcpClose(gDoIP_Socket);
+      gDoIP_Socket = 0;
+      gDoIP_Connected = -1;
+      return;
+    }
+
+    write("DoIP_TCP: init done, ECU=%s IP=%s SA=0x%04X TA=0x%04X",
           gUDS_EcuQualifier, gDoIP_EcuIp, gDoIP_TesterAddr, gDoIP_EcuAddr);
   }
   else
@@ -396,17 +669,21 @@ int UDS_SendRaw()
 void UDS_StartKeepAlive()
 {
   if (gUDS_CommMode == 1)
-  { DoIP_StartKeepAlive(2000); write("UDS_Transport [DoIP]: KeepAlive started"); }
+  { gUDS_KeepAliveActive = 1; setTimer(gUDS_KeepAliveTimer, 2000);
+    write("UDS_Transport [DoIP]: KeepAlive started (3E 80 every 2000ms)"); }
   else
-  { gUDS_KeepAliveActive = 1; setTimer(gUDS_KeepAliveTimer, 2000); write("UDS_Transport [CAN]: KeepAlive started"); }
+  { gUDS_KeepAliveActive = 1; setTimer(gUDS_KeepAliveTimer, 2000);
+    write("UDS_Transport [CAN]: KeepAlive started"); }
 }
 
 void UDS_StopKeepAlive()
 {
+  gUDS_KeepAliveActive = 0;
+  cancelTimer(gUDS_KeepAliveTimer);
   if (gUDS_CommMode == 1)
-  { DoIP_StopKeepAlive(); write("UDS_Transport [DoIP]: KeepAlive stopped"); }
+    write("UDS_Transport [DoIP]: KeepAlive stopped");
   else
-  { gUDS_KeepAliveActive = 0; cancelTimer(gUDS_KeepAliveTimer); write("UDS_Transport [CAN]: KeepAlive stopped"); }
+    write("UDS_Transport [CAN]: KeepAlive stopped");
 }
 
 /******************************************************************************
@@ -416,10 +693,12 @@ void UDS_StopKeepAlive()
 void UDS_Deinit()
 {
   UDS_StopKeepAlive();
-  if (gUDS_CommMode == 1 && gDoIP_Connected == 1)
+  if (gUDS_CommMode == 1 && gDoIP_Socket != 0)
   {
-    DoIP_Disconnect();
+    TcpClose(gDoIP_Socket);
+    gDoIP_Socket = 0;
     gDoIP_Connected = 0;
+    gDoIP_RxPos = 0;
     write("UDS_Transport [DoIP]: disconnected");
   }
   gUDS_TxId = 0;
@@ -429,26 +708,127 @@ void UDS_Deinit()
 
 on timer gUDS_KeepAliveTimer
 {
-  message * kaMsg;
   if (!gUDS_KeepAliveActive) return;
-  if (gUDS_TxId == 0) return;
-  if (gIsoTp_TxBusy) return;
-  /* 使用功能寻址 0x7DF 而非物理寻址 (gUDS_TxId):
-   *   - 避免与物理寻址上的 ISO-TP 多帧传输冲突
-   *   - ECU 同时监听功能地址, 3E 80 能正常刷新 S3 定时器
-   *   - 即使传输中间发出也不会打断物理通道的 ISO-TP 状态机 */
-  kaMsg.id      = 0x7DF;
-  kaMsg.FDF     = gUDS_UseFD;
-  kaMsg.BRS     = 0;
-  kaMsg.dlc     = 8;
-  kaMsg.byte(0) = 0x02;
-  kaMsg.byte(1) = 0x3E;
-  kaMsg.byte(2) = 0x80;
-  kaMsg.byte(3) = 0x00;
-  kaMsg.byte(4) = 0x00;
-  kaMsg.byte(5) = 0x00;
-  kaMsg.byte(6) = 0x00;
-  kaMsg.byte(7) = 0x00;
-  output(kaMsg);
+
+  if (gUDS_CommMode == 1)
+  {
+    /* DoIP: 通过 TCP 发送 DoIP 封装的 3E 80 (Trace 可见) */
+    byte kaBuf[2];
+    byte doipKa[20];
+    int  doipLen;
+    if (gDoIP_Connected != 1) return;
+    kaBuf[0] = 0x3E;
+    kaBuf[1] = 0x80;
+    doipLen = DoIP_BuildDiagMsg(doipKa, elcount(doipKa),
+                                gDoIP_TesterAddr, gDoIP_EcuAddr, kaBuf, 2);
+    if (doipLen > 0)
+      DoIP_TcpSendBytes(doipKa, (dword)doipLen);
+  }
+  else
+  {
+    /* CAN: 功能寻址 0x7DF 发送 3E 80 */
+    message * kaMsg;
+    if (gUDS_TxId == 0) return;
+    if (gIsoTp_TxBusy) return;
+    kaMsg.id      = 0x7DF;
+    kaMsg.FDF     = gUDS_UseFD;
+    kaMsg.BRS     = 0;
+    kaMsg.dlc     = 8;
+    kaMsg.byte(0) = 0x02;
+    kaMsg.byte(1) = 0x3E;
+    kaMsg.byte(2) = 0x80;
+    kaMsg.byte(3) = 0x00;
+    kaMsg.byte(4) = 0x00;
+    kaMsg.byte(5) = 0x00;
+    kaMsg.byte(6) = 0x00;
+    kaMsg.byte(7) = 0x00;
+    output(kaMsg);
+  }
   setTimer(gUDS_KeepAliveTimer, 2000);
+}
+
+/******************************************************************************
+ * DoIP 重连 (ECU复位后重新建立 TCP + Routing Activation)
+ * 返回: 1=成功  0=失败(超时)
+ ******************************************************************************/
+int UDS_Reconnect()
+{
+  dword t0, elapsed;
+  int   attempt;
+  int   wasKeepAlive;
+  long  maxWaitMs, retryIntervalMs;
+
+  if (gUDS_CommMode != 1) { write("UDS_Reconnect: CAN模式无需重连"); return 1; }
+
+  wasKeepAlive    = gUDS_KeepAliveActive;
+
+  maxWaitMs       = cDoIP_ReconnectMaxWait;
+  retryIntervalMs = cDoIP_ReconnectInterval;
+
+  write("DoIP_TCP: 重连 %s (最长等待 %dms) ...", gDoIP_EcuIp, maxWaitMs);
+
+  UDS_StopKeepAlive();
+  if (gDoIP_Socket != 0)
+  { TcpClose(gDoIP_Socket); gDoIP_Socket = 0; }
+  gDoIP_Connected = 0;
+  gDoIP_RxPos     = 0;
+
+  t0 = timeNow();
+  attempt = 0;
+
+  while (1)
+  {
+    IP_Endpoint localEp;
+    IP_Endpoint remoteEp;
+    long result;
+    char errorText[200];
+
+    attempt++;
+
+    localEp.ParseEndpointFromString(gDoIP_LocalIp);
+    localEp.PortNumber = 0;
+    gDoIP_Socket = TcpOpen(localEp);
+
+    if (IpGetLastSocketError(gDoIP_Socket) != 0)
+    {
+      IpGetLastSocketErrorAsString(gDoIP_Socket, errorText, elcount(errorText));
+      write("DoIP_TCP: 重连 TcpOpen 失败: %s", errorText);
+      gDoIP_Socket = 0;
+    }
+    else
+    {
+      remoteEp.ParseEndpointFromString(gDoIP_EcuIp);
+      remoteEp.PortNumber = cDoIP_Port;
+      result = TcpConnect(gDoIP_Socket, remoteEp);
+
+      if (result == 0 || IpGetLastSocketError(gDoIP_Socket) == 10035)
+      {
+        if (testWaitForTextEvent("DoIP_ConnectResult", 10000) != 0 && gDoIP_Connected == 1)
+        {
+          elapsed = (timeNow() - t0) / 100;
+          write("DoIP_TCP: 重连成功 (第%d次尝试, %dms)", attempt, elapsed);
+          if (wasKeepAlive)
+            UDS_StartKeepAlive();
+          return 1;
+        }
+      }
+
+      TcpClose(gDoIP_Socket);
+      gDoIP_Socket = 0;
+      gDoIP_Connected = 0;
+      gDoIP_RxPos     = 0;
+    }
+
+    elapsed = (timeNow() - t0) / 100;
+    if (elapsed >= (dword)maxWaitMs)
+    {
+      write("DoIP_TCP: 重连超时! %d次尝试均失败", attempt);
+      gDoIP_Connected = -1;
+      return 0;
+    }
+
+    write("DoIP_TCP: 第%d次重连失败 (%dms), %dms后重试...",
+          attempt, elapsed, retryIntervalMs);
+    testWaitForTextEvent("__delay__", retryIntervalMs);
+  }
 }

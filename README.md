@@ -30,17 +30,20 @@ CANoe CAPL 编写的 UDS 诊断底层库，为上层测试用例提供统一的 
 │         上层测试用例 (.can)       │
 ├─────────────────────────────────┤
 │     UDS_Services.cin  服务层     │  ← 传输无关，所有 UDS 服务封装
+├─────────────────────────────────┤
+│     UDS_Transport.cin 传输层     │  ← CAN/DoIP 双模，gUDS_CommMode 切换
 ├──────────────┬──────────────────┤
-│ CAN_Transport│  DoIP_Transport  │  ← 二选一，提供 UDS_SendRaw()
-│    .cin      │      .cin        │
-└──────────────┴──────────────────┘
+│  CAN ISO-TP  │ DoIP (CANoe      │
+│  (手动分帧)  │  IP_Endpoint API)│
+├──────────────┴──────────────────┤
+│  SecurityKeyBridge.dll          │  ← CAPL DLL: 动态加载 Seed&Key
+└─────────────────────────────────┘
 ```
 
 - 服务层（`UDS_Services.cin`）：收发缓冲区、UDS 服务函数、NRC 处理、CRC32、日志格式化
-- CAN 传输层（`CAN_Transport.cin`）：ISO-TP 分帧/重组（SF/FF/CF/FC）、CAN FD 支持、TesterPresent 保活
-- DoIP 传输层（`DoIP_Transport.cin`）：基于 CANoe DoIP.DLL，TCP 连接管理、Routing Activation
-
-切换传输方式只需替换 `#include` 的传输层文件，服务层代码无需修改。
+- 传输层（`UDS_Transport.cin`）：CAN/DoIP 双模统一传输，通过 `gUDS_CommMode` 切换
+- DoIP 协议栈：内置于传输层，使用 CANoe IP_Endpoint TCP API，Trace 窗口可见
+- SeedKey DLL（`Modules/SecurityKeyBridge.dll`）：动态加载厂商 Seed&Key DLL，替代 `diagGenerateKeyFromSeed()`
 
 ## 使用方式
 
@@ -49,7 +52,8 @@ CANoe CAPL 编写的 UDS 诊断底层库，为上层测试用例提供统一的 
 ```c
 includes
 {
-  #include "CAN_Transport.cin"    // 或 DoIP_Transport.cin
+  #pragma library("./Modules/SecurityKeyBridge.dll")
+  #include "UDS_Transport.cin"
   #include "UDS_Services.cin"
 }
 ```
@@ -57,9 +61,15 @@ includes
 初始化后即可调用服务函数：
 
 ```c
+variables
+{
+  /* 传输模式: 0=CAN, 1=DoIP */
+  int gUDS_CommMode = 0;
+}
+
 on start
 {
-  UDS_Init(0x741, 0x641, "ECU_Name");  // 设置 CAN ID 和 ECU 名称
+  UDS_Init(0x741, 0x641, "ECU_Name");
 }
 
 testcase TC_ReadDID()
@@ -70,3 +80,25 @@ testcase TC_ReadDID()
   UDS_ReadDID(0xF190, data, len);
 }
 ```
+
+### 安全访问 (0x27)
+
+`UDS_SecurityAccess_Unlock()` 通过 SecurityKeyBridge.dll 动态加载厂商 Seed&Key DLL 计算 Key，调用前需设置 DLL 路径和安全等级：
+
+```c
+variables
+{
+  /* Seed&Key DLL 完整路径（支持中文路径） */
+  char gUDS_SeedKeyDllPath[512] = "C:\\测试输入\\GenerateKeyExImpl-UDS.dll";
+}
+
+testcase TC_SecurityAccess()
+{
+  UDS_DiagSessionControl_Extended();
+  gUDS_SecurityLevel = 0x01;           // 安全等级
+  // gUDS_SeedKeyDllPath 已在 variables 中设置
+  UDS_SecurityAccess_Unlock();         // 自动完成: 请求Seed → DLL算Key → 发送Key
+}
+```
+
+**注意**：厂商 Seed&Key DLL 通常依赖 `vcruntime140.dll` 等 CRT，需将这些依赖复制到 Seed&Key DLL 同目录，详见 `DLL/SecurityKeyBridge/SecurityKeyBridge.c` 头注释。
