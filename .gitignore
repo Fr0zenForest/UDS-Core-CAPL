@@ -1,3 +1,5 @@
 temp/
 DLL/*/build/
 experiment/
+Modules/*.dll
+*.exe
