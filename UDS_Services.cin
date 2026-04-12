@@ -27,7 +27,7 @@ variables
 
   /* ========== 超时 ========== */
   const long cUDS_DefaultTimeout = 5000;
-  const long cUDS_P2StarTimeout  = 10000;  /* NRC 0x78 Pending等待间隔, Flash编程期间ECU可能需要较长处理时间 */
+  const long cUDS_P2StarTimeout  = 10000;
 
   /* ========== 请求间隔 ========== */
   const int  cUDS_InterReqDelay  = 100;   /* ms, 避免ECU来不及切换状态 */
@@ -39,8 +39,6 @@ variables
   /* ========== ECU配置 ========== */
   char  gUDS_EcuQualifier[64]  = "";        /* UDS_Init()设置 */
   dword gUDS_SecurityLevel     = 1;
-  int   gUDS_UseFD             = 1;        /* 1=CAN FD  0=Classic CAN */
-  int   gUDS_SeedLen           = 0;        /* 上次检测到的Seed长度 */
 
   /* ========== 测试步骤 ========== */
   char  gStepId[32];
@@ -96,28 +94,19 @@ int UDS_GetNRC()
 }
 
 /******************************************************************************
- * 10 xx 诊断会话控制 (通用)
- ******************************************************************************/
-int UDS_DiagSessionControl(byte sessionType)
-{
-  gUDS_TxBuf[0] = 0x10; gUDS_TxBuf[1] = sessionType; gUDS_TxLen = 2;
-  if (UDS_SendRaw() <= 0) { UDS_FormatRxSummary(3); return 0; }
-  UDS_FormatRxSummary(2);
-  if (!UDS_IsPositiveResponse(0x10)) return 0;
-  /* 进入非默认会话时启动保活, 回默认会话时停止 */
-  if (sessionType != 0x01)
-    UDS_StartKeepAlive();
-  else
-    UDS_StopKeepAlive();
-  return 1;
-}
-
-/******************************************************************************
- * 10 03 进入扩展会话 (便捷封装)
+ * 10 03 进入扩展会话
  ******************************************************************************/
 int UDS_DiagSessionControl_Extended()
 {
-  return UDS_DiagSessionControl(0x03);
+  gUDS_TxBuf[0] = 0x10; gUDS_TxBuf[1] = 0x03; gUDS_TxLen = 2;
+  if (UDS_SendRaw() <= 0) { UDS_FormatRxSummary(3); return 0; }
+  UDS_FormatRxSummary(2);   /* 50 03 */
+  if (UDS_IsPositiveResponse(0x10))
+  {
+    UDS_StartKeepAlive();
+    return 1;
+  }
+  return 0;
 }
 
 /******************************************************************************
@@ -125,7 +114,15 @@ int UDS_DiagSessionControl_Extended()
  ******************************************************************************/
 int UDS_DiagSessionControl_Programming()
 {
-  return UDS_DiagSessionControl(0x02);
+  gUDS_TxBuf[0] = 0x10; gUDS_TxBuf[1] = 0x02; gUDS_TxLen = 2;
+  if (UDS_SendRaw() <= 0) { UDS_FormatRxSummary(3); return 0; }
+  UDS_FormatRxSummary(2);   /* 50 02 */
+  if (UDS_IsPositiveResponse(0x10))
+  {
+    UDS_StartKeepAlive();
+    return 1;
+  }
+  return 0;
 }
 
 /******************************************************************************
@@ -133,7 +130,11 @@ int UDS_DiagSessionControl_Programming()
  ******************************************************************************/
 int UDS_DiagSessionControl_Default()
 {
-  return UDS_DiagSessionControl(0x01);
+  UDS_StopKeepAlive();
+  gUDS_TxBuf[0] = 0x10; gUDS_TxBuf[1] = 0x01; gUDS_TxLen = 2;
+  if (UDS_SendRaw() <= 0) { UDS_FormatRxSummary(3); return 0; }
+  UDS_FormatRxSummary(2);   /* 50 01 */
+  return UDS_IsPositiveResponse(0x10);
 }
 
 /******************************************************************************
@@ -143,16 +144,15 @@ int UDS_ECUReset_Hard()
 {
   UDS_StopKeepAlive();
   gUDS_TxBuf[0] = 0x11; gUDS_TxBuf[1] = 0x01; gUDS_TxLen = 2;
-  if (UDS_SendRaw() <= 0) { UDS_FormatRxSummary(3); return 0; }
+  if (UDS_SendRaw() <= 0) { UDS_FormatRxSummary(2); return 0; }
   UDS_FormatRxSummary(2);
   return UDS_IsPositiveResponse(0x11);
 }
 
 /******************************************************************************
- * 27 xx 请求Seed (支持自动检测Seed长度 + NRC 0x37自动重试)
- *   seedLen=0 表示自动检测(使用响应中的全部Seed), >0 表示截取到指定长度
+ * 27 01 请求Seed
  ******************************************************************************/
-int UDS_SecurityAccess_RequestSeed(byte seedOut[], int seedLen)
+int UDS_SecurityAccess_RequestSeed(byte seedOut[], int seedBufSize, int &seedActualLen)
 {
   int i;
   int actualLen;
@@ -162,27 +162,63 @@ int UDS_SecurityAccess_RequestSeed(byte seedOut[], int seedLen)
     gUDS_TxBuf[0] = 0x27; gUDS_TxBuf[1] = (byte)gUDS_SecurityLevel; gUDS_TxLen = 2;
     if (UDS_SendRaw() <= 0) { UDS_FormatRxSummary(3); return 0; }
 
-    /* NRC 0x37: 惩罚计时器未过期, 等待后重试一次 */
+    /* NRC 0x37: penalty timer still active, wait and retry once */
     if (UDS_GetNRC() == 0x37 && retry == 0)
     {
-      write("UDS_Services: NRC 0x37 (requiredTimeDelayNotExpired), 等待 %d ms...", cSA_PenaltyDelay);
-      /* KeepAlive 定时器已在 0x7DF 功能寻址上持续发送 3E 80, 无需手动构造 */
-      testWaitForTimeout((int)cSA_PenaltyDelay);
+      int waitRemain;
+      write("UDS_Services: NRC 0x37 (requiredTimeDelayNotExpired), waiting %d ms...", cSA_PenaltyDelay);
+      /* Send 3E 80 (TesterPresent, suppressPosRsp) every 1s to keep session alive */
+      waitRemain = (int)cSA_PenaltyDelay;
+      while (waitRemain > 0)
+      {
+        if (gUDS_CommMode == 0)
+        {
+          /* CAN 模式: 功能寻址 0x7DF, 避免干扰物理通道 ISO-TP */
+          message * tpMsg;
+          tpMsg.id      = 0x7DF;
+          tpMsg.FDF     = gUDS_UseFD;
+          tpMsg.BRS     = 0;
+          tpMsg.dlc     = 8;
+          tpMsg.byte(0) = 0x02;
+          tpMsg.byte(1) = 0x3E;
+          tpMsg.byte(2) = 0x80;
+          tpMsg.byte(3) = 0x00;
+          tpMsg.byte(4) = 0x00;
+          tpMsg.byte(5) = 0x00;
+          tpMsg.byte(6) = 0x00;
+          tpMsg.byte(7) = 0x00;
+          output(tpMsg);
+        }
+        else
+        {
+          /* DoIP 模式: 通过 DLL 发送 3E 80 */
+          byte tpBuf[2];
+          tpBuf[0] = 0x3E;
+          tpBuf[1] = 0x80;
+          DoIP_Send(gDoIP_EcuAddr, tpBuf, 2);
+        }
+        if (waitRemain > 1000)
+          testWaitForTimeout(1000);
+        else
+          testWaitForTimeout(waitRemain);
+        waitRemain -= 1000;
+      }
       continue;
     }
 
     if (!UDS_IsPositiveResponse(0x27)) { UDS_FormatRxSummary(3); return 0; }
     actualLen = (int)gUDS_RxLen - 2;
     if (actualLen <= 0) { UDS_FormatRxSummary(2); return 0; }
-    if (seedLen > 0)
+    if (actualLen > seedBufSize)
     {
-      if (actualLen < seedLen) { UDS_FormatRxSummary(2); return 0; }
-      actualLen = seedLen;
+      write("UDS_Services: Seed长度(%d)超出缓冲区(%d)", actualLen, seedBufSize);
+      UDS_FormatRxSummary(2);
+      return 0;
     }
-    gUDS_SeedLen = actualLen;
-    UDS_FormatRxSummary(2);   /* 67 xx */
-    for (i = 0; i < actualLen && i < elcount(seedOut); i++)
+    UDS_FormatRxSummary(2);   /* 67 01 */
+    for (i = 0; i < actualLen; i++)
       seedOut[i] = gUDS_RxBuf[2 + i];
+    seedActualLen = actualLen;
     write("UDS_Services: Seed长度=%d字节", actualLen);
     return 1;
   }
@@ -241,20 +277,22 @@ int UDS_SecurityAccess_Unlock()
   byte  seedArray[32];
   byte  keyArray[32];
   dword keyLen;
+  int   seedLen;
 
-  if (!UDS_SecurityAccess_RequestSeed(seedArray, 0))
+  seedLen = 0;
+  if (!UDS_SecurityAccess_RequestSeed(seedArray, elcount(seedArray), seedLen))
   {
     write("UDS_Services: Seed请求失败");
     return 0;
   }
   {
     char tmpHex[128];
-    UDS_FormatHex(seedArray, gUDS_SeedLen, tmpHex, elcount(tmpHex));
-    write("UDS_Services: Seed=%s (%d字节)", tmpHex, gUDS_SeedLen);
+    UDS_FormatHex(seedArray, seedLen, tmpHex, elcount(tmpHex));
+    write("UDS_Services: Seed=%s (%d字节)", tmpHex, seedLen);
   }
 
   keyLen = 0;
-  if (!UDS_GenerateKeyFromSeed(seedArray, (dword)gUDS_SeedLen, keyArray, elcount(keyArray), keyLen))
+  if (!UDS_GenerateKeyFromSeed(seedArray, (dword)seedLen, keyArray, elcount(keyArray), keyLen))
   {
     write("UDS_Services: Key计算失败");
     return 0;
@@ -375,9 +413,9 @@ int UDS_RoutineControl_StartWithData(word routineId,
   gUDS_TxBuf[0] = 0x31; gUDS_TxBuf[1] = 0x01;
   gUDS_TxBuf[2] = (byte)((routineId >> 8) & 0xFF);
   gUDS_TxBuf[3] = (byte)(routineId & 0xFF);
-  if (payloadInLen > elcount(gUDS_TxBuf) - 4)
+  if (payloadInLen > 4092)
   {
-    write("UDS_Services: RoutineControl载荷过大 %d>%d", payloadInLen, elcount(gUDS_TxBuf) - 4);
+    write("UDS_Services: RoutineControl载荷过大 %d>4092", payloadInLen);
     return 0;
   }
   for (i = 0; i < payloadInLen; i++)
@@ -445,9 +483,9 @@ int UDS_RequestDownload(byte dataFmtId, byte addrLenFmtId,
 int UDS_TransferData(byte blockSeq, byte data[], int dataLen)
 {
   int i;
-  if (dataLen > elcount(gUDS_TxBuf) - 2)
+  if (dataLen > 4094)
   {
-    write("UDS_Services: TransferData数据过大 %d>%d", dataLen, elcount(gUDS_TxBuf) - 2);
+    write("UDS_Services: TransferData数据过大 %d>4094", dataLen);
     return 0;
   }
   gUDS_TxBuf[0] = 0x36;
