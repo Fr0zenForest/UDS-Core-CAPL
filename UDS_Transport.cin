@@ -712,7 +712,9 @@ on timer gUDS_KeepAliveTimer
 
   if (gUDS_CommMode == 1)
   {
-    /* DoIP: 通过 TCP 发送 DoIP 封装的 3E 80 (Trace 可见) */
+    /* DoIP: 功能寻址 TA=0xE400 发送 3E 80 (与CAN 0x7DF同理)
+     * 避免在 TransferData 等多帧传输期间, 3E 80 插入同一 SA/TA 物理通道
+     * 导致 ECU 中断正在处理的请求 */
     byte kaBuf[2];
     byte doipKa[20];
     int  doipLen;
@@ -720,7 +722,7 @@ on timer gUDS_KeepAliveTimer
     kaBuf[0] = 0x3E;
     kaBuf[1] = 0x80;
     doipLen = DoIP_BuildDiagMsg(doipKa, elcount(doipKa),
-                                gDoIP_TesterAddr, gDoIP_EcuAddr, kaBuf, 2);
+                                gDoIP_TesterAddr, 0xE400, kaBuf, 2);
     if (doipLen > 0)
       DoIP_TcpSendBytes(doipKa, (dword)doipLen);
   }
