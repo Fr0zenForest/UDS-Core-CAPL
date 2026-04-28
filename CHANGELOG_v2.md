@@ -4,6 +4,69 @@
 
 ---
 
+## [v2.3.1] - 2026-04-28
+
+### 变更: cUDS_InterReqDelay 去除 const 限定
+
+`cUDS_InterReqDelay` 从 `const int` 改为 `int`，允许下游项目在运行时临时覆盖请求间隔。
+典型场景：SecurityFlash 的 TransferData (0x36) 循环中临时置零以消除不必要的 100ms 延迟
+（ECU 的 0x76 正响应已确认就绪），循环结束后恢复原值。
+
+**改动文件**:
+
+| 文件 | 改动 |
+|------|------|
+| `UDS_Services.cin` | `const int cUDS_InterReqDelay` → `int cUDS_InterReqDelay`，注释补充"非const, Flash可临时覆盖" |
+
+---
+
+## [v2.3-seedkey-flash] - 2026-04-24
+
+### 新增: 双 Seed&Key DLL 支持 (应用级/刷写级)
+
+不同安全级别可能需要不同的 Seed&Key DLL（如应用级 0x01 和刷写级 0x11 使用不同算法）。
+新增 `gUDS_SeedKeyDllPath_Flash` 变量，`UDS_GenerateKeyFromSeed` 根据当前
+`gUDS_SecurityLevel` 自动选择对应 DLL。
+
+**改动文件**:
+
+| 文件 | 改动 |
+|------|------|
+| `UDS_Services.cin` | 新增 `gUDS_SeedKeyDllPath_Flash` 变量；`UDS_GenerateKeyFromSeed` 按安全级别选择 DLL (0x11/0x19 用刷写级，其余用应用级)；错误日志输出实际 DLL 路径 |
+
+**用法**:
+```c
+gUDS_SeedKeyDllPath       = "C:/project/Modules/SeedKey/app_level.dll";
+gUDS_SeedKeyDllPath_Flash = "C:/project/Modules/SeedKey/flash_level.dll";
+gUDS_SecurityLevel = 0x01;  // → 使用 gUDS_SeedKeyDllPath
+gUDS_SecurityLevel = 0x11;  // → 使用 gUDS_SeedKeyDllPath_Flash
+```
+
+**DLL 路径注意事项**:
+- `LoadLibrary` 路径相对于 CANoe 进程工作目录（安装目录）解析，不是项目根目录
+- `#pragma library` 路径相对于 `.can` 文件解析（CAPL 编译器处理）
+- `getProfileString` 路径相对于 `.cfg` 文件解析（CANoe 内部处理）
+- 建议传入绝对路径，避免路径解析歧义
+
+### 修复: DoIP KeepAlive 改为请求期间自动停发
+
+原方案（v2.2 commit 219bb00）将 DoIP KeepAlive 改用功能寻址 TA=0xE400，
+但实测发现部分 ECU 即使收到功能寻址的 3E 80 也会中断当前请求处理。
+
+新方案：新增 `gUDS_TxPending` 标志，`UDS_SendRaw_DoIP` 执行期间自动置 1，
+KeepAlive timer 检测到此标志时跳过发送，请求完成后恢复。
+DoIP KeepAlive 恢复使用物理寻址 `gDoIP_EcuAddr`（与 ECU 的正常诊断通道一致）。
+
+**改动文件**:
+
+| 文件 | 改动 |
+|------|------|
+| `UDS_Transport.cin` | 新增 `gUDS_TxPending` 标志；`UDS_SendRaw_DoIP` 入口置 1、所有返回点清 0；KeepAlive timer DoIP 分支增加 `if (gUDS_TxPending) return;` 检查；移除 0xE400 功能寻址，恢复 `gDoIP_EcuAddr` 物理寻址 |
+
+**CAN 模式不受影响**: CAN KeepAlive 仍使用 0x7DF 功能寻址 + `gIsoTp_TxBusy` 互斥。
+
+---
+
 ## [v2.2-doip-native] - 2026-04-13
 
 ### 重构: DoIP 传输层从 DLL 迁移到 CANoe IP_Endpoint API

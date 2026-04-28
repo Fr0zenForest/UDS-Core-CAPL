@@ -1,4 +1,4 @@
-/*@!Encoding:65001*/
+﻿/*@!Encoding:65001*/
 /******************************************************************************
  * UDS_Services.cin - UDS服务层（传输无关，CAN/DoIP共用）
  *
@@ -30,7 +30,7 @@ variables
   const long cUDS_P2StarTimeout  = 10000;
 
   /* ========== 请求间隔 ========== */
-  const int  cUDS_InterReqDelay  = 100;   /* ms, 避免ECU来不及切换状态 */
+  int  cUDS_InterReqDelay  = 100;   /* ms, 避免ECU来不及切换状态 (非const, Flash可临时覆盖) */
 
   /* ========== CRC32 ========== */
   const dword cCRC32_POLY = 0xEDB88320;
@@ -39,7 +39,8 @@ variables
   /* ========== ECU配置 ========== */
   char  gUDS_EcuQualifier[64]  = "";        /* UDS_Init()设置 */
   dword gUDS_SecurityLevel     = 1;
-  char  gUDS_SeedKeyDllPath[512] = "";      /* Seed&Key DLL路径, 调用前必须设置 */
+  char  gUDS_SeedKeyDllPath[512] = "";      /* Seed&Key DLL路径(应用级), 调用前必须设置 */
+  char  gUDS_SeedKeyDllPath_Flash[512] = ""; /* Seed&Key DLL路径(刷写级), 为空则复用应用级 */
 
   /* ========== 测试步骤 ========== */
   char  gStepId[32];
@@ -121,6 +122,9 @@ int UDS_DiagSessionControl_Programming()
   if (UDS_IsPositiveResponse(0x10))
   {
     UDS_StartKeepAlive();
+    /* 编程会话切换后等待ECU就绪 */
+    write("UDS_Services: 10 02 OK, 等待 1000ms...");
+    testWaitForTimeout(1000);
     return 1;
   }
   return 0;
@@ -253,28 +257,39 @@ int UDS_SecurityAccess_SendKey(byte keyData[], int keyLen)
  * 需要在 .can 文件 includes 中声明:
  *   #pragma library("./Modules/SecurityKeyBridge.dll")
  * 调用前需设置 gUDS_SeedKeyDllPath 为 Seed&Key DLL 的完整路径
+ *
+ * 注意: LoadLibrary 路径相对于 CANoe 进程工作目录(安装目录)解析,
+ *       不是项目根目录。建议传入绝对路径。
  ******************************************************************************/
 int UDS_GenerateKeyFromSeed(byte seedData[], dword seedLen,
                              byte keyOut[], dword keyBufSize, dword &keyOutLen)
 {
   long ret;
+  char dllPath[512];
 
-  if (strlen(gUDS_SeedKeyDllPath) == 0)
+  /* 根据当前安全级别选择DLL: 0x11/0x19用刷写级DLL, 其余用应用级 */
+  if ((gUDS_SecurityLevel == 0x11 || gUDS_SecurityLevel == 0x19)
+      && strlen(gUDS_SeedKeyDllPath_Flash) > 0)
+    strncpy(dllPath, gUDS_SeedKeyDllPath_Flash, elcount(dllPath) - 1);
+  else
+    strncpy(dllPath, gUDS_SeedKeyDllPath, elcount(dllPath) - 1);
+
+  if (strlen(dllPath) == 0)
   {
-    write("UDS_Services: ERROR - gUDS_SeedKeyDllPath未设置");
+    write("UDS_Services: ERROR - SeedKeyDll路径未设置 (level=0x%02X)", gUDS_SecurityLevel);
     return 0;
   }
 
-  ret = SK_GenerateKey(gUDS_SeedKeyDllPath, seedData, (long)seedLen,
+  ret = SK_GenerateKey(dllPath, seedData, (long)seedLen,
                        (long)gUDS_SecurityLevel, keyOut, (long)keyBufSize);
 
   if (ret <= 0)
   {
-    write("UDS_Services: SK_GenerateKey失败 ret=%d (-1=空路径 -2=LoadLibrary失败 -3=函数未找到 -4=计算错误)", ret);
+    write("UDS_Services: SK_GenerateKey失败 ret=%d dll=%s (-1=空路径 -2=LoadLibrary失败 -3=函数未找到 -4=计算错误)", ret, dllPath);
     return 0;
   }
   keyOutLen = (dword)ret;
-  write("UDS_Services: Key计算成功 keyLen=%d", keyOutLen);
+  write("UDS_Services: Key计算成功 keyLen=%d (dll=%s)", keyOutLen, dllPath);
   return 1;
 }
 
