@@ -82,6 +82,15 @@ variables
 
   /* ========== ISO-TP 多帧互斥锁 ========== */
   int     gIsoTp_TxBusy = 0;
+
+  /* ========== UDS 请求/响应进行中标志 ========== */
+  int     gUDS_TxPending = 0;  /* 1=正在等待ECU响应, KeepAlive应暂停 */
+
+  /* ========== 多路 CAN 通道 ========== */
+  const int CH_PRIMARY   = 1;  /* CAN1 — 默认通道 */
+  const int CH_AUXILIARY = 2;  /* CAN2 — 辅助通道 */
+  const int CH_MONITOR   = 3;  /* CAN3 — 监听通道 (只收) */
+  int gCAN_ActiveChannel = 1;  /* 当前活跃通道, 默认 CAN1 */
 }
 
 /*=============================================================================
@@ -331,6 +340,7 @@ on message 0x600-0x7FF
   dword dlen;
   int   i, dataStart, frameLen;
 
+  if (this.can != gCAN_ActiveChannel) return;
   if (this.id != gUDS_RxId) return;
 
   frameLen = IsoTp_DlcToLen(this.dlc);
@@ -403,6 +413,7 @@ on message 0x600-0x7FF
 void IsoTp_SendFC()
 {
   message * msg;
+  msg.can = gCAN_ActiveChannel;
   msg.dlc = 8; msg.FDF = gUDS_UseFD; msg.BRS = 0; msg.id = gUDS_TxId;
   msg.byte(0) = 0x30; msg.byte(1) = 0x00; msg.byte(2) = 0x00; msg.byte(3) = 0x00;
   msg.byte(4) = 0x00; msg.byte(5) = 0x00; msg.byte(6) = 0x00; msg.byte(7) = 0x00;
@@ -430,6 +441,7 @@ int UDS_SendRaw_CAN()
   write("TX [0x%03X] %d bytes: %s", gUDS_TxId, txLen, gUDS_HexBuf);
 
   msg.FDF = gUDS_UseFD; msg.BRS = 0; msg.id = gUDS_TxId;
+  msg.can = gCAN_ActiveChannel;
 
   if (txLen <= 7)
   {
@@ -546,6 +558,7 @@ int UDS_SendRaw_DoIP()
   if (gDoIP_Connected != 1) { write("DoIP_TCP: not connected"); return -1; }
 
   gUDS_RxReady = 0; gUDS_RxLen = 0;
+  gUDS_TxPending = 1;
   txLen = gUDS_TxLen;
 
   testWaitForTextEvent("__delay__", cUDS_InterReqDelay);
@@ -557,13 +570,13 @@ int UDS_SendRaw_DoIP()
   doipLen = DoIP_BuildDiagMsg(doipBuf, elcount(doipBuf),
                               gDoIP_TesterAddr, gDoIP_EcuAddr,
                               gUDS_TxBuf, txLen);
-  if (doipLen <= 0) { write("DoIP_TCP: build diag msg failed"); return -1; }
+  if (doipLen <= 0) { write("DoIP_TCP: build diag msg failed"); gUDS_TxPending = 0; return -1; }
   DoIP_TcpSendBytes(doipBuf, (dword)doipLen);
 
   if (testWaitForTextEvent("UDS_RxDone", cUDS_DefaultTimeout) == 0)
-  { elapsedMs = (timeNow() - t0) / 100; write("RX [DoIP<-0x%04X] TIMEOUT %dms", gDoIP_EcuAddr, elapsedMs); return 0; }
+  { elapsedMs = (timeNow() - t0) / 100; write("RX [DoIP<-0x%04X] TIMEOUT %dms", gDoIP_EcuAddr, elapsedMs); gUDS_TxPending = 0; return 0; }
   if (gUDS_RxReady != 1)
-  { elapsedMs = (timeNow() - t0) / 100; write("RX [DoIP<-0x%04X] ERROR (%dms)", gDoIP_EcuAddr, elapsedMs); return -1; }
+  { elapsedMs = (timeNow() - t0) / 100; write("RX [DoIP<-0x%04X] ERROR (%dms)", gDoIP_EcuAddr, elapsedMs); gUDS_TxPending = 0; return -1; }
 
   elapsedMs = (timeNow() - t0) / 100;
   UDS_FormatHex(gUDS_RxBuf, gUDS_RxLen, gUDS_HexBuf, elcount(gUDS_HexBuf));
@@ -574,12 +587,13 @@ int UDS_SendRaw_DoIP()
     write("RX [DoIP<-0x%04X] NRC 0x78 Pending, waiting...", gDoIP_EcuAddr);
     gUDS_RxReady = 0; gUDS_RxLen = 0;
     if (testWaitForTextEvent("UDS_RxDone", cUDS_P2StarTimeout) == 0)
-    { elapsedMs = (timeNow() - t0) / 100; write("RX [DoIP<-0x%04X] P2* TIMEOUT %dms", gDoIP_EcuAddr, elapsedMs); return 0; }
-    if (gUDS_RxReady != 1) return 0;
+    { elapsedMs = (timeNow() - t0) / 100; write("RX [DoIP<-0x%04X] P2* TIMEOUT %dms", gDoIP_EcuAddr, elapsedMs); gUDS_TxPending = 0; return 0; }
+    if (gUDS_RxReady != 1) { gUDS_TxPending = 0; return 0; }
     elapsedMs = (timeNow() - t0) / 100;
     UDS_FormatHex(gUDS_RxBuf, gUDS_RxLen, gUDS_HexBuf, elcount(gUDS_HexBuf));
     write("RX [DoIP<-0x%04X] %d bytes (%dms): %s", gDoIP_EcuAddr, gUDS_RxLen, elapsedMs, gUDS_HexBuf);
   }
+  gUDS_TxPending = 0;
   return 1;
 }
 
@@ -712,17 +726,17 @@ on timer gUDS_KeepAliveTimer
 
   if (gUDS_CommMode == 1)
   {
-    /* DoIP: 功能寻址 TA=0xE400 发送 3E 80 (与CAN 0x7DF同理)
-     * 避免在 TransferData 等多帧传输期间, 3E 80 插入同一 SA/TA 物理通道
-     * 导致 ECU 中断正在处理的请求 */
+    /* DoIP: 请求/响应进行中时跳过 KeepAlive, 避免 3E 80 打断 ECU 处理
+     * 即使用功能寻址 0xE400, 部分 ECU 仍会中断当前请求 */
     byte kaBuf[2];
     byte doipKa[20];
     int  doipLen;
     if (gDoIP_Connected != 1) return;
+    if (gUDS_TxPending) return;
     kaBuf[0] = 0x3E;
     kaBuf[1] = 0x80;
     doipLen = DoIP_BuildDiagMsg(doipKa, elcount(doipKa),
-                                gDoIP_TesterAddr, 0xE400, kaBuf, 2);
+                                gDoIP_TesterAddr, gDoIP_EcuAddr, kaBuf, 2);
     if (doipLen > 0)
       DoIP_TcpSendBytes(doipKa, (dword)doipLen);
   }
@@ -732,6 +746,7 @@ on timer gUDS_KeepAliveTimer
     message * kaMsg;
     if (gUDS_TxId == 0) return;
     if (gIsoTp_TxBusy) return;
+    kaMsg.can     = gCAN_ActiveChannel;
     kaMsg.id      = 0x7DF;
     kaMsg.FDF     = gUDS_UseFD;
     kaMsg.BRS     = 0;

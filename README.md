@@ -88,17 +88,53 @@ testcase TC_ReadDID()
 ```c
 variables
 {
-  /* Seed&Key DLL 完整路径（支持中文路径） */
-  char gUDS_SeedKeyDllPath[512] = "C:\\测试输入\\GenerateKeyExImpl-UDS.dll";
+  /* Seed&Key DLL 完整路径（支持中文路径）
+   * 应用级和刷写级可使用不同 DLL，按 gUDS_SecurityLevel 自动选择:
+   *   0x11/0x19 → gUDS_SeedKeyDllPath_Flash (刷写级)
+   *   其余      → gUDS_SeedKeyDllPath       (应用级)
+   * 如果 gUDS_SeedKeyDllPath_Flash 为空，统一使用应用级 DLL */
+  char gUDS_SeedKeyDllPath[512]       = "C:\\project\\Modules\\SeedKey\\app_level.dll";
+  char gUDS_SeedKeyDllPath_Flash[512] = "C:\\project\\Modules\\SeedKey\\flash_level.dll";
 }
 
 testcase TC_SecurityAccess()
 {
   UDS_DiagSessionControl_Extended();
-  gUDS_SecurityLevel = 0x01;           // 安全等级
-  // gUDS_SeedKeyDllPath 已在 variables 中设置
-  UDS_SecurityAccess_Unlock();         // 自动完成: 请求Seed → DLL算Key → 发送Key
+  gUDS_SecurityLevel = 0x01;           // 应用级 → 使用 gUDS_SeedKeyDllPath
+  UDS_SecurityAccess_Unlock();
+
+  gUDS_SecurityLevel = 0x11;           // 刷写级 → 使用 gUDS_SeedKeyDllPath_Flash
+  UDS_SecurityAccess_Unlock();
 }
 ```
 
+**DLL 路径注意事项**：
+
+| 路径类型 | 解析基准 | 示例 |
+|----------|----------|------|
+| `#pragma library("./Modules/xxx.dll")` | 相对于 `.can` 文件 | CAPL 编译器处理 |
+| `getProfileString(..., iniPath)` | 相对于 `.cfg` 文件 | CANoe 内部处理 |
+| `LoadLibrary("xxx.dll")` (DLL内部) | 相对于 CANoe 进程 CWD (安装目录) | Windows API |
+
+三者的路径解析基准不同，是常见的混淆点。**建议 `gUDS_SeedKeyDllPath` 使用绝对路径**，避免 `LoadLibrary` 在 CANoe 安装目录下找不到 DLL（返回 -326 = ERROR_MOD_NOT_FOUND）。
+
 **注意**：厂商 Seed&Key DLL 通常依赖 `vcruntime140.dll` 等 CRT，需将这些依赖复制到 Seed&Key DLL 同目录，详见 `DLL/SecurityKeyBridge/SecurityKeyBridge.c` 头注释。
+
+### 多路 CAN 通道
+
+传输层内置多通道支持，通过 `gCAN_ActiveChannel` 控制发送和接收的 CAN 通道：
+
+```c
+variables
+{
+  /* 通道常量 (UDS_Transport.cin 已定义) */
+  /* CH_PRIMARY   = 1   CAN1 — 默认通道 */
+  /* CH_AUXILIARY = 2   CAN2 — 辅助通道 */
+  /* CH_MONITOR   = 3   CAN3 — 监听通道 */
+
+  /* 切换活跃通道 (默认 CAN1, 无需修改即兼容单通道) */
+  /* gCAN_ActiveChannel = 2; */
+}
+```
+
+典型场景：台架测试中 CAN1 接诊断，网关转发到其他总线，其他总线并联接入 CANoe CAN2，通过切换 `gCAN_ActiveChannel` 或在不同通道上分别监听来验证转发行为。

@@ -4,6 +4,32 @@
 
 ---
 
+## [v2.4.0] - 2026-05-14
+
+### 新增: 多路 CAN 通道支持
+
+传输层新增通道常量和活跃通道变量，所有 CAN 发送/接收均通过 `gCAN_ActiveChannel` 显式指定通道，支持多路 CAN 台架测试场景（如诊断转发验证）。
+
+**改动文件**:
+
+| 文件 | 改动 |
+|------|------|
+| `UDS_Transport.cin` | 新增 `CH_PRIMARY/CH_AUXILIARY/CH_MONITOR` 常量 + `gCAN_ActiveChannel` 变量；`on message` 入口加通道过滤；`IsoTp_SendFC()`、`UDS_SendRaw_CAN()`、KeepAlive 发送均加 `msg.can = gCAN_ActiveChannel` |
+
+**向后兼容**: `gCAN_ActiveChannel` 默认值为 1 (CAN1)，不修改此变量的项目行为完全不变。
+
+**用法**:
+```c
+/* 切换到 CAN2 发送/接收 */
+gCAN_ActiveChannel = CH_AUXILIARY;
+UDS_SendRaw();
+
+/* 恢复默认 */
+gCAN_ActiveChannel = CH_PRIMARY;
+```
+
+---
+
 ## [v2.3.1] - 2026-04-28
 
 ### 变更: cUDS_InterReqDelay 去除 const 限定
