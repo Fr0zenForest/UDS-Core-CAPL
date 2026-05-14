@@ -1,5 +1,7 @@
 # UDS-Core-CAPL
 
+> **此分支 (v1.0) 已停止维护。** 请切换到 [v2 分支](../../tree/v2) 获取最新版本，v2 支持 CAN/DoIP 双模传输、多路 CAN 通道、SecurityKeyBridge DLL 等新特性。
+
 CANoe CAPL 编写的 UDS 诊断底层库，为上层测试用例提供统一的 UDS 服务接口。
 
 ## 用途
